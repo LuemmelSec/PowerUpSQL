@@ -16695,8 +16695,17 @@ Function Get-SQLEncryptionStatus
                         $TcpClient.EndConnect($ConnectResult)
                         Write-Verbose "  EndConnect successful"
                     } catch {
-                        Write-Verbose "  EndConnect failed: $($_.Exception.GetType().FullName) - $($_.Exception.Message)"
-                        throw "Connection failed: $($_.Exception.Message)"
+                        $ErrorMsg = $_.Exception.Message
+                        Write-Verbose "  EndConnect failed: $($_.Exception.GetType().FullName) - $ErrorMsg"
+                        
+                        # Check for specific errors
+                        if($ErrorMsg -match "actively refused|connection refused") {
+                            throw "Connection refused - SQL Server not listening on port $Port"
+                        } elseif($ErrorMsg -match "timed out") {
+                            throw "Connection timed out"
+                        } else {
+                            throw "Connection failed: $ErrorMsg"
+                        }
                     }
                 } else {
                     Write-Verbose "  Connection timed out after $($TimeOut) seconds"
@@ -16757,38 +16766,70 @@ Function Get-SQLEncryptionStatus
                 Write-Verbose "  Reading TDS pre-login response..."
                 $ResponseHeader = New-Object byte[] 8
                 $BytesRead = $Stream.Read($ResponseHeader, 0, 8)
+                Write-Verbose "  Read $BytesRead header bytes"
                 
                 if($BytesRead -eq 8) {
+                    $HeaderHex = ($ResponseHeader | ForEach-Object { $_.ToString("X2") }) -join " "
+                    Write-Verbose "  Response header: $HeaderHex"
+                    
+                    $ResponseType = $ResponseHeader[0]
+                    $ResponseStatus = $ResponseHeader[1]
                     $ResponseLength = ([int]$ResponseHeader[2] -shl 8) + [int]$ResponseHeader[3]
-                    $ResponsePayload = New-Object byte[] ($ResponseLength - 8)
-                    $BytesRead = $Stream.Read($ResponsePayload, 0, $ResponsePayload.Length)
                     
-                    # Parse pre-login response to find ENCRYPTION option
-                    Write-Verbose "  Parsing encryption flag from response..."
-                    $i = 0
-                    $EncryptionOffset = -1
+                    Write-Verbose "  Response type: 0x$($ResponseType.ToString('X2')), status: 0x$($ResponseStatus.ToString('X2')), length: $ResponseLength"
                     
-                    while($i -lt $ResponsePayload.Length) {
-                        $OptionType = $ResponsePayload[$i]
+                    if($ResponseLength -gt 8) {
+                        $ResponsePayload = New-Object byte[] ($ResponseLength - 8)
+                        $BytesRead = $Stream.Read($ResponsePayload, 0, $ResponsePayload.Length)
+                        Write-Verbose "  Read $BytesRead payload bytes (expected $($ResponseLength - 8))"
                         
-                        if($OptionType -eq 0xFF) {
-                            # Terminator found
-                            break
+                        $PayloadHex = ($ResponsePayload[0..([Math]::Min(50, $ResponsePayload.Length-1))] | ForEach-Object { $_.ToString("X2") }) -join " "
+                        Write-Verbose "  Payload start: $PayloadHex..."
+                        
+                        # Parse pre-login response to find ENCRYPTION option
+                        Write-Verbose "  Parsing encryption flag from response..."
+                        $i = 0
+                        $EncryptionOffset = -1
+                        
+                        while($i -lt $ResponsePayload.Length) {
+                            $OptionType = $ResponsePayload[$i]
+                            Write-Verbose "    Option at index $i : type 0x$($OptionType.ToString('X2'))"
+                            
+                            if($OptionType -eq 0xFF) {
+                                # Terminator found
+                                Write-Verbose "    Found terminator at index $i"
+                                break
+                            }
+                            
+                            if($i + 4 -ge $ResponsePayload.Length) {
+                                Write-Verbose "    Not enough bytes for option header"
+                                break
+                            }
+                            
+                            $Offset = ([int]$ResponsePayload[$i+1] -shl 8) + [int]$ResponsePayload[$i+2]
+                            $Length = ([int]$ResponsePayload[$i+3] -shl 8) + [int]$ResponsePayload[$i+4]
+                            Write-Verbose "    Offset: $Offset, Length: $Length"
+                            
+                            if($OptionType -eq 0x01) {
+                                # ENCRYPTION option found
+                                $EncryptionOffset = $Offset
+                                Write-Verbose "    Found ENCRYPTION option! Offset in payload: $EncryptionOffset"
+                                break
+                            }
+                            
+                            $i += 5  # Move to next option (type + offset[2] + length[2])
                         }
                         
-                        if($OptionType -eq 0x01) {
-                            # ENCRYPTION option found
-                            $EncryptionOffset = ([int]$ResponsePayload[$i+1] -shl 8) + [int]$ResponsePayload[$i+2]
-                            break
-                        }
-                        
-                        $i += 5  # Move to next option (type + offset[2] + length[2])
-                    }
-                    
-                    if($EncryptionOffset -ge 0 -and $EncryptionOffset -lt $ResponsePayload.Length) {
-                        $EncryptionValue = $ResponsePayload[$EncryptionOffset - 8]  # Adjust for header
-                        
-                        Write-Verbose "  Encryption flag value: 0x$($EncryptionValue.ToString('X2'))"
+                        if($EncryptionOffset -ge 0) {
+                            # The offset is relative to the start of the packet (including header)
+                            # So we need to subtract 8 to get the index in the payload
+                            $PayloadIndex = $EncryptionOffset - 8
+                            Write-Verbose "  Encryption value at payload index: $PayloadIndex"
+                            
+                            if($PayloadIndex -ge 0 -and $PayloadIndex -lt $ResponsePayload.Length) {
+                                $EncryptionValue = $ResponsePayload[$PayloadIndex]
+                                
+                                Write-Verbose "  Encryption flag value: 0x$($EncryptionValue.ToString('X2'))"
                         
                         switch($EncryptionValue) {
                             0x00 { 
@@ -16818,12 +16859,20 @@ Function Get-SQLEncryptionStatus
                         }
                     } else {
                         $EncryptionStatus = "Unknown"
-                        Write-Verbose "RESULT: Could not find encryption option in response"
+                        Write-Verbose "RESULT: Encryption offset out of range (offset: $EncryptionOffset, payload index: $PayloadIndex, payload length: $($ResponsePayload.Length))"
                     }
                 } else {
                     $EncryptionStatus = "Unknown"
-                    Write-Verbose "RESULT: Invalid response from server"
+                    Write-Verbose "RESULT: Could not find encryption option in response"
                 }
+            } else {
+                $EncryptionStatus = "Unknown"
+                Write-Verbose "RESULT: Invalid response length: $ResponseLength"
+            }
+        } else {
+            $EncryptionStatus = "Unknown"
+            Write-Verbose "RESULT: Invalid response header (read $BytesRead bytes instead of 8)"
+        }
                 
                 $Stream.Close()
                 $TcpClient.Close()
@@ -16833,12 +16882,14 @@ Function Get-SQLEncryptionStatus
             }
         } catch {
             $EncryptionStatus = "Unknown"
-            $ErrorDetails = "Type: $($_.Exception.GetType().FullName)`nMessage: $($_.Exception.Message)"
-            if($_.Exception.InnerException) {
-                $ErrorDetails += "`nInner: $($_.Exception.InnerException.GetType().FullName) - $($_.Exception.InnerException.Message)"
+            $ErrorMsg = if($_.Exception.Message -match "Connection refused") {
+                "Port $Port not accepting connections (wrong port or SQL not running)"
+            } elseif($_.Exception.Message -match "timed out") {
+                "Connection timed out"
+            } else {
+                $_.Exception.Message
             }
-            Write-Verbose "RESULT: Error - $ErrorDetails"
-            Write-Verbose "Full Error:`n$($_ | Out-String)"
+            Write-Verbose "RESULT: Cannot test - $ErrorMsg"
         } finally {
             if($TcpClient -ne $null) {
                 if($TcpClient.Connected) {
