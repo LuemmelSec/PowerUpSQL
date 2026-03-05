@@ -16283,6 +16283,16 @@ Function  Get-SQLInstanceDomain
 
         [Parameter(Mandatory = $false,
                 ValueFromPipelineByPropertyName = $true,
+        HelpMessage = 'Always test default port 1433 on each hostname, even if not in SPN.')]
+        [switch]$CheckDefaultInstance,
+
+        [Parameter(Mandatory = $false,
+                ValueFromPipelineByPropertyName = $true,
+        HelpMessage = 'Use UDP SQL Browser (port 1434) to discover all instances dynamically on each host.')]
+        [switch]$DiscoverDynamicPorts,
+
+        [Parameter(Mandatory = $false,
+                ValueFromPipelineByPropertyName = $true,
         HelpMessage = 'Preforms a DNS lookup on the instance.')]
         [switch]$IncludeIP,
 
@@ -16575,6 +16585,283 @@ Function  Get-SQLInstanceDomain
 
             # Add SQL Server spn to table
             $null = $TblSQLServerSpns.Rows.Add($TableRow)
+        }
+
+        # Additional discovery: check default port 1433 and/or use UDP discovery
+        if($CheckDefaultInstance -or $DiscoverDynamicPorts)
+        {
+            # Extract unique hostnames from SPN results
+            $UniqueHosts = @()
+            if($TblSQLServers) {
+                $UniqueHosts = $TblSQLServers | 
+                    Select-Object -Property ComputerName -Unique | 
+                    ForEach-Object { $_.ComputerName }
+            }
+            
+            Write-Verbose -Message "Found $($UniqueHosts.Count) unique hosts from SPNs for additional discovery..."
+            
+            # Track instances we've already tested to avoid duplicates
+            $AlreadyTested = @{}
+            foreach($Row in $TblSQLServerSpns.Rows) {
+                $AlreadyTested[$Row.Instance] = $true
+            }
+            
+            # Process each unique hostname
+            foreach($HostName in $UniqueHosts)
+            {
+                Write-Verbose -Message "Processing additional discovery for $HostName..."
+                
+                # List to store newly discovered instances for this host
+                $NewInstances = @()
+                
+                # Check default instance on port 1433
+                if($CheckDefaultInstance)
+                {
+                    $DefaultInstance = "$HostName,1433"
+                    if(-not $AlreadyTested.ContainsKey($DefaultInstance)) {
+                        Write-Verbose -Message "  Adding default instance: $DefaultInstance"
+                        $NewInstances += @{
+                            ComputerName = $HostName
+                            Instance = $DefaultInstance
+                            InstanceName = "MSSQLSERVER"
+                            TCPPort = 1433
+                            Source = "DefaultPort"
+                        }
+                        $AlreadyTested[$DefaultInstance] = $true
+                    } else {
+                        Write-Verbose -Message "  Default instance $DefaultInstance already discovered via SPN"
+                    }
+                }
+                
+                # Use UDP SQL Browser to discover all instances
+                if($DiscoverDynamicPorts)
+                {
+                    Write-Verbose -Message "  Running UDP discovery on $HostName..."
+                    try {
+                        $UDPResults = Get-SQLInstanceScanUDP -ComputerName $HostName -UDPTimeOut $UDPTimeOut -SuppressVerbose
+                        
+                        foreach($UDPResult in $UDPResults) {
+                            $UDPInstance = $UDPResult.Instance
+                            if(-not $AlreadyTested.ContainsKey($UDPInstance)) {
+                                Write-Verbose -Message "    Discovered via UDP: $UDPInstance (Port $($UDPResult.TCPPort))"
+                                $NewInstances += @{
+                                    ComputerName = $UDPResult.ComputerName
+                                    Instance = $UDPInstance
+                                    InstanceName = $UDPResult.InstanceName
+                                    TCPPort = $UDPResult.TCPPort
+                                    Source = "UDP"
+                                    BaseVersion = $UDPResult.BaseVersion
+                                    IsClustered = $UDPResult.IsClustered
+                                }
+                                $AlreadyTested[$UDPInstance] = $true
+                            } else {
+                                Write-Verbose -Message "    Instance $UDPInstance already discovered"
+                            }
+                        }
+                    } catch {
+                        Write-Verbose -Message "    UDP discovery failed: $($_.Exception.Message)"
+                    }
+                }
+                
+                # Process newly discovered instances
+                foreach($NewInstance in $NewInstances)
+                {
+                    Write-Verbose -Message "  Processing newly discovered instance: $($NewInstance.Instance)"
+                    
+                    # Build table row with available data
+                    $TableRow = @(
+                        [string]$NewInstance.ComputerName,
+                        [string]$NewInstance.Instance,
+                        '',  # DomainAccountSid - not available for non-SPN discoveries
+                        '',  # DomainAccount - not available for non-SPN discoveries
+                        '',  # DomainAccountCn - not available for non-SPN discoveries
+                        '',  # Service - not available for non-SPN discoveries
+                        "Discovered via $($NewInstance.Source)",  # Spn - indicate discovery method
+                        '',  # LastLogon - not available for non-SPN discoveries
+                        "Discovered via $($NewInstance.Source)"  # Description
+                    )
+                    
+                    # Get IP address if requested
+                    if($IncludeIP)
+                    {
+                        try {
+                            $IPAddress = [Net.DNS]::GetHostAddresses([String]$NewInstance.ComputerName).IPAddressToString
+                            if($IPAddress -is [Object[]]) {
+                                $IPAddress = $IPAddress -join ", "
+                            }
+                        } catch {
+                            $IPAddress = "0.0.0.0"
+                        }
+                        $TableRow += $IPAddress
+                    }
+                    
+                    # Test encryption if requested
+                    if($CheckEncryption)
+                    {
+                        Write-Verbose -Message "    Testing encryption on $($NewInstance.Instance)..."
+                        $EncryptionStatus = "Unknown"
+                        
+                        $TestComputer = $NewInstance.ComputerName
+                        $TestPort = $NewInstance.TCPPort
+                        
+                        # Test encryption using TDS pre-login
+                        $TcpClient = $null
+                        try {
+                            $TcpClient = New-Object System.Net.Sockets.TcpClient
+                            
+                            $ConnectResult = $TcpClient.BeginConnect($TestComputer, $TestPort, $null, $null)
+                            $WaitHandle = $ConnectResult.AsyncWaitHandle
+                            
+                            if($WaitHandle.WaitOne(10000, $false)) {
+                                try {
+                                    $TcpClient.EndConnect($ConnectResult)
+                                } catch {
+                                    $EncryptionStatus = "Unknown"
+                                }
+                            } else {
+                                $EncryptionStatus = "Unknown"
+                            }
+                            
+                            if($TcpClient.Connected) {
+                                $Stream = $TcpClient.GetStream()
+                                $Stream.ReadTimeout = 10000
+                                $Stream.WriteTimeout = 5000
+                                
+                                # Build TDS pre-login packet (same as in main loop)
+                                $Version = @(0x08, 0x00, 0x01, 0x55, 0x00, 0x00)
+                                $EncryptionValue = @(0x02)
+                                $InstanceBytes = [System.Text.Encoding]::ASCII.GetBytes("MSSQLServer`0")
+                                $ThreadIDBytes = [BitConverter]::GetBytes([uint32](Get-Random -Maximum 65535))
+                                
+                                $VersionOffset = 21
+                                $EncryptionOffset = $VersionOffset + $Version.Length
+                                $InstanceOffset = $EncryptionOffset + $EncryptionValue.Length
+                                $ThreadIDOffset = $InstanceOffset + $InstanceBytes.Length
+                                
+                                $PreLoginOptions = @(
+                                    0x00,
+                                    ([byte]($VersionOffset -shr 8)),
+                                    ([byte]($VersionOffset -band 0xFF)),
+                                    ([byte]($Version.Length -shr 8)),
+                                    ([byte]($Version.Length -band 0xFF)),
+                                    0x01,
+                                    ([byte]($EncryptionOffset -shr 8)),
+                                    ([byte]($EncryptionOffset -band 0xFF)),
+                                    0x00, 0x01,
+                                    0x02,
+                                    ([byte]($InstanceOffset -shr 8)),
+                                    ([byte]($InstanceOffset -band 0xFF)),
+                                    ([byte]($InstanceBytes.Length -shr 8)),
+                                    ([byte]($InstanceBytes.Length -band 0xFF)),
+                                    0x03,
+                                    ([byte]($ThreadIDOffset -shr 8)),
+                                    ([byte]($ThreadIDOffset -band 0xFF)),
+                                    0x00, 0x04,
+                                    0xFF
+                                )
+                                
+                                $PreLoginData = [System.Collections.ArrayList]@()
+                                $null = $PreLoginData.AddRange($Version)
+                                $null = $PreLoginData.AddRange($EncryptionValue)
+                                $null = $PreLoginData.AddRange($InstanceBytes)
+                                $null = $PreLoginData.AddRange($ThreadIDBytes)
+                                
+                                $PreLoginPayload = [System.Collections.ArrayList]@()
+                                $null = $PreLoginPayload.AddRange($PreLoginOptions)
+                                $null = $PreLoginPayload.AddRange($PreLoginData)
+                                
+                                $PayloadLength = $PreLoginPayload.Count
+                                $TotalLength = 8 + $PayloadLength
+                                
+                                $TdsHeader = @(
+                                    0x12, 0x01,
+                                    ([byte]($TotalLength -shr 8)),
+                                    ([byte]($TotalLength -band 0xFF)),
+                                    0x00, 0x00, 0x00, 0x00
+                                )
+                                
+                                $TdsPacket = [System.Collections.ArrayList]@()
+                                $null = $TdsPacket.AddRange($TdsHeader)
+                                $null = $TdsPacket.AddRange($PreLoginPayload)
+                                
+                                $PacketBytes = [byte[]]$TdsPacket.ToArray()
+                                $Stream.Write($PacketBytes, 0, $PacketBytes.Length)
+                                $Stream.Flush()
+                                
+                                $ResponseHeader = New-Object byte[] 8
+                                $BytesRead = $Stream.Read($ResponseHeader, 0, 8)
+                                Write-Verbose "      Read $BytesRead response header bytes"
+                                
+                                if($BytesRead -eq 8) {
+                                    $ResponseLength = ([int]$ResponseHeader[2] -shl 8) + [int]$ResponseHeader[3]
+                                    Write-Verbose "      Response length: $ResponseLength"
+                                    
+                                    if($ResponseLength -gt 8) {
+                                        $ResponsePayload = New-Object byte[] ($ResponseLength - 8)
+                                        $BytesRead = $Stream.Read($ResponsePayload, 0, $ResponsePayload.Length)
+                                        Write-Verbose "      Read $BytesRead payload bytes"
+                                    
+                                        # Find ENCRYPTION option
+                                        $i = 0
+                                        $EncryptionOffset = -1
+                                        
+                                        while($i -lt $ResponsePayload.Length) {
+                                            $OptionType = $ResponsePayload[$i]
+                                            if($OptionType -eq 0xFF) { break }
+                                            if($OptionType -eq 0x01) {
+                                                $EncryptionOffset = ([int]$ResponsePayload[$i+1] -shl 8) + [int]$ResponsePayload[$i+2]
+                                                break
+                                            }
+                                            $i += 5
+                                        }
+                                        
+                                        if($EncryptionOffset -ge 0) {
+                                            if($EncryptionOffset -lt $ResponsePayload.Length) {
+                                                $EncryptionValue = $ResponsePayload[$EncryptionOffset]
+                                                
+                                                # Only 0x02 (TDS_ENCRYPT_NOT_SUP) means NOT enforced
+                                                if($EncryptionValue -eq 0x02) {
+                                                    $EncryptionStatus = "No"
+                                                } else {
+                                                    $EncryptionStatus = "Yes"
+                                                }
+                                            } else {
+                                                Write-Verbose "      Encryption offset $EncryptionOffset out of range"
+                                            }
+                                        } else {
+                                            Write-Verbose "      Encryption option not found in response"
+                                        }
+                                    } else {
+                                        Write-Verbose "      Response length too short: $ResponseLength"
+                                    }
+                                } else {
+                                    Write-Verbose "      Failed to read response header"
+                                }
+                                
+                                $Stream.Close()
+                                $TcpClient.Close()
+                            }
+                        } catch {
+                            $EncryptionStatus = "Unknown"
+                            Write-Verbose "      Encryption test error: $($_.Exception.Message)"
+                        } finally {
+                            if($TcpClient -ne $null) {
+                                if($TcpClient.Connected) {
+                                    try { $TcpClient.Close() } catch { }
+                                }
+                                try { $TcpClient.Dispose() } catch { }
+                            }
+                        }
+                        
+                        $TableRow += $EncryptionStatus
+                        Write-Verbose -Message "      Encryption Enforced: $EncryptionStatus"
+                    }
+                    
+                    # Add newly discovered instance to table
+                    $null = $TblSQLServerSpns.Rows.Add($TableRow)
+                    Write-Verbose -Message "    Added to results"
+                }
+            }
         }
 
         # Enumerate SQL Server instances from management servers
