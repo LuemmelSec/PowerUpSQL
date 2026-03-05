@@ -16413,12 +16413,15 @@ Function  Get-SQLInstanceDomain
                 # Test encryption if we have a port
                 if($TestPort -and $EncryptionStatus -eq "Unknown")
                 {
+                    $TcpClient = $null
                     try {
                         # Use TDS pre-login to test encryption enforcement
                         $TcpClient = New-Object System.Net.Sockets.TcpClient
-                        $ConnectTask = $TcpClient.ConnectAsync($TestComputer, $TestPort)
+                        $TcpClient.ReceiveTimeout = 3000
+                        $TcpClient.SendTimeout = 3000
+                        $TcpClient.Connect($TestComputer, $TestPort)
                         
-                        if($ConnectTask.Wait(3000)) {
+                        if($TcpClient.Connected) {
                             $Stream = $TcpClient.GetStream()
                             $Stream.ReadTimeout = 3000
                             $Stream.WriteTimeout = 3000
@@ -16492,8 +16495,11 @@ Function  Get-SQLInstanceDomain
                     } catch {
                         $EncryptionStatus = "Unknown"
                     } finally {
-                        if($TcpClient -and $TcpClient.Connected) {
-                            $TcpClient.Close()
+                        if($TcpClient -ne $null) {
+                            if($TcpClient.Connected) {
+                                try { $TcpClient.Close() } catch { }
+                            }
+                            try { $TcpClient.Dispose() } catch { }
                         }
                     }
                 }
@@ -16654,18 +16660,22 @@ Function Get-SQLEncryptionStatus
         
         # Test using TDS pre-login packet (like mssqlrelay does)
         $EncryptionStatus = "Unknown"
+        $TcpClient = $null
         
         try {
             # Create TCP connection
             $TcpClient = New-Object System.Net.Sockets.TcpClient
-            $ConnectTask = $TcpClient.ConnectAsync($Computer, $Port)
-            $TimeoutMs = $TimeOut * 1000
+            $TcpClient.ReceiveTimeout = $TimeOut * 1000
+            $TcpClient.SendTimeout = $TimeOut * 1000
             
-            if($ConnectTask.Wait($TimeoutMs)) {
+            Write-Verbose "  Connecting to ${Computer}:${Port}..."
+            $TcpClient.Connect($Computer, $Port)
+            
+            if($TcpClient.Connected) {
                 Write-Verbose "  TCP connection established"
                 $Stream = $TcpClient.GetStream()
-                $Stream.ReadTimeout = $TimeoutMs
-                $Stream.WriteTimeout = $TimeoutMs
+                $Stream.ReadTimeout = $TimeOut * 1000
+                $Stream.WriteTimeout = $TimeOut * 1000
                 
                 # Build TDS pre-login packet
                 # TDS Header: Type=0x12 (Pre-Login), Status=0x01 (End of message), Length, SPID=0x0000, PacketID=0x00, Window=0x00
@@ -16779,14 +16789,17 @@ Function Get-SQLEncryptionStatus
                 $TcpClient.Close()
             } else {
                 $EncryptionStatus = "Unknown"
-                Write-Verbose "RESULT: Connection timeout - server not reachable"
+                Write-Verbose "RESULT: Not connected"
             }
         } catch {
             $EncryptionStatus = "Unknown"
             Write-Verbose "RESULT: Error - $($_.Exception.Message)"
         } finally {
-            if($TcpClient -and $TcpClient.Connected) {
-                $TcpClient.Close()
+            if($TcpClient -ne $null) {
+                if($TcpClient.Connected) {
+                    try { $TcpClient.Close() } catch { }
+                }
+                try { $TcpClient.Dispose() } catch { }
             }
         }
         
