@@ -16490,12 +16490,11 @@ Function  Get-SQLInstanceDomain
                                 if($EncryptionOffset -ge 0 -and $EncryptionOffset -lt $ResponsePayload.Length) {
                                     $EncryptionValue = $ResponsePayload[$EncryptionOffset - 8]
                                     
-                                    switch($EncryptionValue) {
-                                        0x00 { $EncryptionStatus = "No" }   # ENCRYPT_OFF
-                                        0x01 { $EncryptionStatus = "Yes" }  # ENCRYPT_ON
-                                        0x02 { $EncryptionStatus = "No" }   # ENCRYPT_NOT_SUP
-                                        0x03 { $EncryptionStatus = "No" }   # ENCRYPT_REQ
-                                        default { $EncryptionStatus = "Unknown" }
+                                    # Only 0x02 (TDS_ENCRYPT_NOT_SUP) means NOT enforced
+                                    if($EncryptionValue -eq 0x02) {
+                                        $EncryptionStatus = "No"
+                                    } else {
+                                        $EncryptionStatus = "Yes"
                                     }
                                 }
                             }
@@ -16726,29 +16725,65 @@ Function Get-SQLEncryptionStatus
                 $Stream.ReadTimeout = $TimeOut * 1000
                 $Stream.WriteTimeout = $TimeOut * 1000
                 
-                # Build TDS pre-login packet
+                # Build TDS pre-login packet (exactly as impacket does)
                 # TDS Header: Type=0x12 (Pre-Login), Status=0x01 (End of message), Length, SPID=0x0000, PacketID=0x00, Window=0x00
-                # Pre-Login Options: VERSION, ENCRYPTION, INSTOPT, THREADID, MARS, TRACEID, FEDAUTHREQUIRED, TERMINATOR
                 
-                # Pre-login payload with ENCRYPTION option
-                # Offsets are from start of packet (header=8 bytes + option table=21 bytes = data starts at byte 29/0x1D)
-                $PreLoginPayload = @(
-                    0x00, 0x00, 0x1D, 0x00, 0x06,  # VERSION option: offset 0x001D (29), length 6
-                    0x01, 0x00, 0x23, 0x00, 0x01,  # ENCRYPTION option: offset 0x0023 (35), length 1 (this is what we care about!)
-                    0x02, 0x00, 0x24, 0x00, 0x01,  # INSTOPT option: offset 0x0024 (36), length 1
-                    0x03, 0x00, 0x25, 0x00, 0x04,  # THREADID option: offset 0x0025 (37), length 4
-                    0xFF,                           # TERMINATOR
-                    0x09, 0x00, 0x00, 0x00, 0x00, 0x00, # VERSION value (9.0.0.0)
-                    0x00,                           # ENCRYPTION value: 0x00 = NOT required (we request no encryption)
-                    0x00,                           # INSTOPT value
-                    0x00, 0x00, 0x00, 0x00          # THREADID value
+                # Pre-login option tokens (21 bytes total before data section)
+                $Version = @(0x08, 0x00, 0x01, 0x55, 0x00, 0x00)  # Version 8.0.0.0
+                $EncryptionValue = @(0x02)  # TDS_ENCRYPT_NOT_SUP - we say we don't support, server tells us what IT requires
+                $InstanceBytes = [System.Text.Encoding]::ASCII.GetBytes("MSSQLServer`0")
+                $ThreadIDBytes = [BitConverter]::GetBytes([uint32](Get-Random -Maximum 65535))
+                
+                # Calculate offsets (start from byte 21 after TDS header, which is byte 29 from start of packet)
+                $VersionOffset = 21
+                $EncryptionOffset = $VersionOffset + $Version.Length
+                $InstanceOffset = $EncryptionOffset + $EncryptionValue.Length
+                $ThreadIDOffset = $InstanceOffset + $InstanceBytes.Length
+                
+                # Build option token section (big-endian for offsets/lengths)
+                $PreLoginOptions = @(
+                    0x00,                                                # VERSION token
+                    ([byte]($VersionOffset -shr 8)),                    # VERSION offset high byte
+                    ([byte]($VersionOffset -band 0xFF)),                # VERSION offset low byte
+                    ([byte]($Version.Length -shr 8)),                   # VERSION length high byte
+                    ([byte]($Version.Length -band 0xFF)),               # VERSION length low byte
+                    
+                    0x01,                                                # ENCRYPTION token
+                    ([byte]($EncryptionOffset -shr 8)),                 # ENCRYPTION offset high byte
+                    ([byte]($EncryptionOffset -band 0xFF)),             # ENCRYPTION offset low byte
+                    0x00, 0x01,                                          # ENCRYPTION length = 1
+                    
+                    0x02,                                                # INSTANCE token
+                    ([byte]($InstanceOffset -shr 8)),                   # INSTANCE offset high byte
+                    ([byte]($InstanceOffset -band 0xFF)),               # INSTANCE offset low byte
+                    ([byte]($InstanceBytes.Length -shr 8)),             # INSTANCE length high byte
+                    ([byte]($InstanceBytes.Length -band 0xFF)),         # INSTANCE length low byte
+                    
+                    0x03,                                                # THREADID token
+                    ([byte]($ThreadIDOffset -shr 8)),                   # THREADID offset high byte
+                    ([byte]($ThreadIDOffset -band 0xFF)),               # THREADID offset low byte
+                    0x00, 0x04,                                          # THREADID length = 4
+                    
+                    0xFF                                                 # TERMINATOR
                 )
                 
-                $PayloadLength = $PreLoginPayload.Length
+                # Build data section
+                $PreLoginData = [System.Collections.ArrayList]@()
+                $null = $PreLoginData.AddRange($Version)
+                $null = $PreLoginData.AddRange($EncryptionValue)
+                $null = $PreLoginData.AddRange($InstanceBytes)
+                $null = $PreLoginData.AddRange($ThreadIDBytes)
+                
+                # Build complete payload
+                $PreLoginPayload = [System.Collections.ArrayList]@()
+                $null = $PreLoginPayload.AddRange($PreLoginOptions)
+                $null = $PreLoginPayload.AddRange($PreLoginData)
+                
+                $PayloadLength = $PreLoginPayload.Count
                 $TotalLength = 8 + $PayloadLength
                 
                 # TDS Header
-                $TdsPacket = @(
+                $TdsHeader = @(
                     0x12,                                    # Type: Pre-Login
                     0x01,                                    # Status: End of message
                     ([byte]($TotalLength -shr 8)),          # Length high byte
@@ -16756,15 +16791,38 @@ Function Get-SQLEncryptionStatus
                     0x00, 0x00,                              # SPID
                     0x00,                                    # PacketID
                     0x00                                     # Window
-                ) + $PreLoginPayload
+                )
+                
+                $TdsPacket = [System.Collections.ArrayList]@()
+                $null = $TdsPacket.AddRange($TdsHeader)
+                $null = $TdsPacket.AddRange($PreLoginPayload)
                 
                 # Send pre-login packet
                 Write-Verbose "  Sending TDS pre-login packet..."
-                $Stream.Write($TdsPacket, 0, $TdsPacket.Length)
-                $Stream.Flush()
+                try {
+                    $PacketBytes = [byte[]]$TdsPacket.ToArray()
+                    $PacketHex = ($PacketBytes | ForEach-Object { $_.ToString("X2") }) -join " "
+                    Write-Verbose "  Packet ($($PacketBytes.Length) bytes): $PacketHex"
+                    $Stream.Write($PacketBytes, 0, $PacketBytes.Length)
+                    $Stream.Flush()
+                } catch {
+                    Write-Verbose "  Error building/sending packet: $_"
+                    throw
+                }
+                
+                # Give server time to respond
+                Start-Sleep -Milliseconds 1000
+                
+                # Check if connection is still alive
+                Write-Verbose "  Connection still alive: $($TcpClient.Connected)"
                 
                 # Read response
                 Write-Verbose "  Reading TDS pre-login response..."
+                if($Stream.DataAvailable) {
+                    Write-Verbose "  Data is available to read"
+                } else {
+                    Write-Verbose "  WARNING: No data available yet, attempting read anyway..."
+                }
                 $ResponseHeader = New-Object byte[] 8
                 $BytesRead = $Stream.Read($ResponseHeader, 0, 8)
                 Write-Verbose "  Read $BytesRead header bytes"
@@ -16832,31 +16890,18 @@ Function Get-SQLEncryptionStatus
                                 
                                 Write-Verbose "  Encryption flag value: 0x$($EncryptionValue.ToString('X2'))"
                         
-                        switch($EncryptionValue) {
-                            0x00 { 
-                                # ENCRYPT_OFF - Encryption available but not required
-                                $EncryptionStatus = "No"
-                                Write-Verbose "RESULT: Encryption NOT enforced - Vulnerable to NTLM relay"
-                            }
-                            0x01 { 
-                                # ENCRYPT_ON - Encryption required
-                                $EncryptionStatus = "Yes"
-                                Write-Verbose "RESULT: Encryption IS enforced - Protected"
-                            }
-                            0x02 { 
-                                # ENCRYPT_NOT_SUP - Encryption not supported
-                                $EncryptionStatus = "No"
-                                Write-Verbose "RESULT: Encryption not supported - Vulnerable to NTLM relay"
-                            }
-                            0x03 { 
-                                # ENCRYPT_REQ - Client requested encryption
-                                $EncryptionStatus = "No"
-                                Write-Verbose "RESULT: Encryption NOT enforced (only client-requested) - Vulnerable to NTLM relay"
-                            }
-                            default {
-                                $EncryptionStatus = "Unknown"
-                                Write-Verbose "RESULT: Unknown encryption value: 0x$($EncryptionValue.ToString('X2'))"
-                            }
+                        # When we send TDS_ENCRYPT_NOT_SUP (0x02), server response interpretation:
+                        # 0x02 = Server agrees, no encryption needed = NOT enforced (vulnerable to relay)
+                        # Anything else = Server requires encryption = IS enforced (protected)
+                        if($EncryptionValue -eq 0x02) {
+                            # TDS_ENCRYPT_NOT_SUP - Server allows unencrypted connections
+                            $EncryptionStatus = "No"
+                            Write-Verbose "RESULT: Encryption NOT enforced - Vulnerable to NTLM relay"
+                        } else {
+                            # TDS_ENCRYPT_OFF (0x00), TDS_ENCRYPT_ON (0x01), TDS_ENCRYPT_REQ (0x03)
+                            # All mean encryption is enforced when we say we don't support it
+                            $EncryptionStatus = "Yes"
+                            Write-Verbose "RESULT: Encryption IS enforced (response: 0x$($EncryptionValue.ToString('X2'))) - Protected from NTLM relay"
                         }
                     } else {
                         $EncryptionStatus = "Unknown"
