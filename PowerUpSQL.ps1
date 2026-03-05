@@ -16664,37 +16664,46 @@ Function  Get-SQLInstanceDomain
                         Write-Verbose -Message "  Error getting current database: $($_.Exception.Message)"
                     }
                     
-                    # Check xp_dirtree access
+                    # Check xp_dirtree access (check permissions, don't execute)
                     try {
-                        $XpDirtreeTest = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_dirtree 'C:\',0,0" -SuppressVerbose -ErrorAction SilentlyContinue
-                        if($XpDirtreeTest -or $?) {
+                        $XpPrivQuery = "SELECT HAS_PERMS_BY_NAME('master..xp_dirtree', 'OBJECT', 'EXECUTE') as HasPermission"
+                        $XpDirtreeTest = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query $XpPrivQuery -SuppressVerbose -TimeOut 5
+                        if($XpDirtreeTest.HasPermission -eq 1) {
                             $HasXpDirtree = "Yes"
                             Write-Verbose -Message "  xp_dirtree: Available"
+                        } else {
+                            Write-Verbose -Message "  xp_dirtree: No permission"
                         }
                     } catch {
-                        Write-Verbose -Message "  xp_dirtree: Not available"
+                        Write-Verbose -Message "  xp_dirtree: Check failed - $($_.Exception.Message)"
                     }
                     
-                    # Check xp_fileexist access
+                    # Check xp_fileexist access (check permissions, don't execute)
                     try {
-                        $XpFileexistTest = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_fileexist 'C:\Windows\win.ini'" -SuppressVerbose -ErrorAction SilentlyContinue
-                        if($XpFileexistTest -or $?) {
+                        $XpPrivQuery = "SELECT HAS_PERMS_BY_NAME('master..xp_fileexist', 'OBJECT', 'EXECUTE') as HasPermission"
+                        $XpFileexistTest = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query $XpPrivQuery -SuppressVerbose -TimeOut 5
+                        if($XpFileexistTest.HasPermission -eq 1) {
                             $HasXpFileexist = "Yes"
                             Write-Verbose -Message "  xp_fileexist: Available"
+                        } else {
+                            Write-Verbose -Message "  xp_fileexist: No permission"
                         }
                     } catch {
-                        Write-Verbose -Message "  xp_fileexist: Not available"
+                        Write-Verbose -Message "  xp_fileexist: Check failed - $($_.Exception.Message)"
                     }
                     
-                    # Check xp_cmdshell access
+                    # Check xp_cmdshell access (check permissions, don't execute)
                     try {
-                        $XpCmdshellTest = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_cmdshell 'echo test'" -SuppressVerbose -ErrorAction SilentlyContinue
-                        if($XpCmdshellTest -or $?) {
+                        $XpPrivQuery = "SELECT HAS_PERMS_BY_NAME('master..xp_cmdshell', 'OBJECT', 'EXECUTE') as HasPermission"
+                        $XpCmdshellTest = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query $XpPrivQuery -SuppressVerbose -TimeOut 5
+                        if($XpCmdshellTest.HasPermission -eq 1) {
                             $HasXpCmdshell = "Yes"
                             Write-Verbose -Message "  xp_cmdshell: Available"
+                        } else {
+                            Write-Verbose -Message "  xp_cmdshell: No permission"
                         }
                     } catch {
-                        Write-Verbose -Message "  xp_cmdshell: Not available"
+                        Write-Verbose -Message "  xp_cmdshell: Check failed - $($_.Exception.Message)"
                     }
                 }
                 else
@@ -17038,37 +17047,46 @@ Function  Get-SQLInstanceDomain
                                 Write-Verbose -Message "        Error getting current database: $($_.Exception.Message)"
                             }
                             
-                            # Check xp_dirtree access
+                            # Check xp_dirtree access (check permissions, don't execute)
                             try {
-                                $XpDirtreeTest = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_dirtree 'C:\',0,0" -SuppressVerbose -ErrorAction SilentlyContinue
-                                if($XpDirtreeTest -or $?) {
+                                $XpPrivQuery = "SELECT HAS_PERMS_BY_NAME('master..xp_dirtree', 'OBJECT', 'EXECUTE') as HasPermission"
+                                $XpDirtreeTest = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query $XpPrivQuery -SuppressVerbose -TimeOut 5
+                                if($XpDirtreeTest.HasPermission -eq 1) {
                                     $HasXpDirtree = "Yes"
                                     Write-Verbose -Message "        xp_dirtree: Available"
+                                } else {
+                                    Write-Verbose -Message "        xp_dirtree: No permission"
                                 }
                             } catch {
-                                Write-Verbose -Message "        xp_dirtree: Not available"
+                                Write-Verbose -Message "        xp_dirtree: Check failed - $($_.Exception.Message)"
                             }
                             
-                            # Check xp_fileexist access
+                            # Check xp_fileexist access (check permissions, don't execute)
                             try {
-                                $XpFileexistTest = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_fileexist 'C:\Windows\win.ini'" -SuppressVerbose -ErrorAction SilentlyContinue
-                                if($XpFileexistTest -or $?) {
+                                $XpPrivQuery = "SELECT HAS_PERMS_BY_NAME('master..xp_fileexist', 'OBJECT', 'EXECUTE') as HasPermission"
+                                $XpFileexistTest = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query $XpPrivQuery -SuppressVerbose -TimeOut 5
+                                if($XpFileexistTest.HasPermission -eq 1) {
                                     $HasXpFileexist = "Yes"
                                     Write-Verbose -Message "        xp_fileexist: Available"
+                                } else {
+                                    Write-Verbose -Message "        xp_fileexist: No permission"
                                 }
                             } catch {
-                                Write-Verbose -Message "        xp_fileexist: Not available"
+                                Write-Verbose -Message "        xp_fileexist: Check failed - $($_.Exception.Message)"
                             }
                             
-                            # Check xp_cmdshell access
+                            # Check xp_cmdshell access (check permissions, don't execute)
                             try {
-                                $XpCmdshellTest = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_cmdshell 'echo test'" -SuppressVerbose -ErrorAction SilentlyContinue
-                                if($XpCmdshellTest -or $?) {
+                                $XpPrivQuery = "SELECT HAS_PERMS_BY_NAME('master..xp_cmdshell', 'OBJECT', 'EXECUTE') as HasPermission"
+                                $XpCmdshellTest = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query $XpPrivQuery -SuppressVerbose -TimeOut 5
+                                if($XpCmdshellTest.HasPermission -eq 1) {
                                     $HasXpCmdshell = "Yes"
                                     Write-Verbose -Message "        xp_cmdshell: Available"
+                                } else {
+                                    Write-Verbose -Message "        xp_cmdshell: No permission"
                                 }
                             } catch {
-                                Write-Verbose -Message "        xp_cmdshell: Not available"
+                                Write-Verbose -Message "        xp_cmdshell: Check failed - $($_.Exception.Message)"
                             }
                         }
                         else
