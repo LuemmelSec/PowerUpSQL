@@ -16439,30 +16439,65 @@ Function  Get-SQLInstanceDomain
                             $Stream.ReadTimeout = 10000
                             $Stream.WriteTimeout = 5000
                             
-                            # TDS pre-login packet
-                            $PreLoginPayload = @(
-                                0x00, 0x00, 0x1A, 0x00, 0x06,
-                                0x01, 0x00, 0x20, 0x00, 0x01,
-                                0x02, 0x00, 0x21, 0x00, 0x01,
-                                0x03, 0x00, 0x22, 0x00, 0x04,
-                                0xFF,
-                                0x09, 0x00, 0x00, 0x00, 0x00, 0x00,
+                            # Build TDS pre-login packet (same as Get-SQLEncryptionStatus)
+                            $Version = @(0x08, 0x00, 0x01, 0x55, 0x00, 0x00)
+                            $EncryptionValue = @(0x02)
+                            $InstanceBytes = [System.Text.Encoding]::ASCII.GetBytes("MSSQLServer`0")
+                            $ThreadIDBytes = [BitConverter]::GetBytes([uint32](Get-Random -Maximum 65535))
+                            
+                            $VersionOffset = 21
+                            $EncryptionOffset = $VersionOffset + $Version.Length
+                            $InstanceOffset = $EncryptionOffset + $EncryptionValue.Length
+                            $ThreadIDOffset = $InstanceOffset + $InstanceBytes.Length
+                            
+                            $PreLoginOptions = @(
                                 0x00,
-                                0x00,
-                                0x00, 0x00, 0x00, 0x00
+                                ([byte]($VersionOffset -shr 8)),
+                                ([byte]($VersionOffset -band 0xFF)),
+                                ([byte]($Version.Length -shr 8)),
+                                ([byte]($Version.Length -band 0xFF)),
+                                0x01,
+                                ([byte]($EncryptionOffset -shr 8)),
+                                ([byte]($EncryptionOffset -band 0xFF)),
+                                0x00, 0x01,
+                                0x02,
+                                ([byte]($InstanceOffset -shr 8)),
+                                ([byte]($InstanceOffset -band 0xFF)),
+                                ([byte]($InstanceBytes.Length -shr 8)),
+                                ([byte]($InstanceBytes.Length -band 0xFF)),
+                                0x03,
+                                ([byte]($ThreadIDOffset -shr 8)),
+                                ([byte]($ThreadIDOffset -band 0xFF)),
+                                0x00, 0x04,
+                                0xFF
                             )
                             
-                            $PayloadLength = $PreLoginPayload.Length
+                            $PreLoginData = [System.Collections.ArrayList]@()
+                            $null = $PreLoginData.AddRange($Version)
+                            $null = $PreLoginData.AddRange($EncryptionValue)
+                            $null = $PreLoginData.AddRange($InstanceBytes)
+                            $null = $PreLoginData.AddRange($ThreadIDBytes)
+                            
+                            $PreLoginPayload = [System.Collections.ArrayList]@()
+                            $null = $PreLoginPayload.AddRange($PreLoginOptions)
+                            $null = $PreLoginPayload.AddRange($PreLoginData)
+                            
+                            $PayloadLength = $PreLoginPayload.Count
                             $TotalLength = 8 + $PayloadLength
                             
-                            $TdsPacket = @(
+                            $TdsHeader = @(
                                 0x12, 0x01,
                                 ([byte]($TotalLength -shr 8)),
                                 ([byte]($TotalLength -band 0xFF)),
                                 0x00, 0x00, 0x00, 0x00
-                            ) + $PreLoginPayload
+                            )
                             
-                            $Stream.Write($TdsPacket, 0, $TdsPacket.Length)
+                            $TdsPacket = [System.Collections.ArrayList]@()
+                            $null = $TdsPacket.AddRange($TdsHeader)
+                            $null = $TdsPacket.AddRange($PreLoginPayload)
+                            
+                            $PacketBytes = [byte[]]$TdsPacket.ToArray()
+                            $Stream.Write($PacketBytes, 0, $PacketBytes.Length)
                             $Stream.Flush()
                             
                             $ResponseHeader = New-Object byte[] 8
