@@ -39,6 +39,7 @@
         'Get-SQLDomainController',
         'Get-SQLDomainExploitableSystem',
         'Get-SQLDomainGroupMember',
+        'Get-SQLEncryptionStatus',
         'Get-SQLFuzzDatabaseName', 
         'Get-SQLFuzzDomainAccount', 
         'Get-SQLFuzzObjectName', 
@@ -119,4 +120,3 @@
     )
     FileList          = 'PowerUpSQL.psm1', 'PowerUpSQL.ps1', 'README.md'
 }
-
