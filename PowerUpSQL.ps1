@@ -16628,6 +16628,7 @@ Function Get-SQLEncryptionStatus
         $NoEncryptSuccess = $false
         $NoEncryptError = ""
         
+        Write-Verbose "  Testing without encryption..."
         try {
             $ConnStr = "Server=$Computer,$Port;Connection Timeout=$TimeOut;Encrypt=False;"
             $Conn = New-Object System.Data.SqlClient.SqlConnection($ConnStr)
@@ -16636,20 +16637,24 @@ Function Get-SQLEncryptionStatus
                 $Conn.Open()
                 $NoEncryptSuccess = $true
                 $Conn.Close()
+                Write-Verbose "  Non-encrypted: SUCCESS"
             } catch {
                 $NoEncryptError = $_.Exception.Message
+                Write-Verbose "  Non-encrypted: FAILED - $($_.Exception.Message.Substring(0, [Math]::Min(100, $_.Exception.Message.Length)))..."
             } finally {
                 if($Conn.State -eq 'Open') { $Conn.Close() }
                 $Conn.Dispose()
             }
         } catch {
             $NoEncryptError = $_.Exception.Message
+            Write-Verbose "  Non-encrypted: ERROR - $($_.Exception.Message.Substring(0, [Math]::Min(100, $_.Exception.Message.Length)))..."
         }
         
         # Test connection WITH encryption
         $WithEncryptSuccess = $false
         $WithEncryptError = ""
         
+        Write-Verbose "  Testing with encryption..."
         try {
             $ConnStrEnc = "Server=$Computer,$Port;Connection Timeout=$TimeOut;Encrypt=True;TrustServerCertificate=True;"
             $ConnEnc = New-Object System.Data.SqlClient.SqlConnection($ConnStrEnc)
@@ -16658,44 +16663,52 @@ Function Get-SQLEncryptionStatus
                 $ConnEnc.Open()
                 $WithEncryptSuccess = $true
                 $ConnEnc.Close()
+                Write-Verbose "  Encrypted: SUCCESS"
             } catch {
                 $WithEncryptError = $_.Exception.Message
+                Write-Verbose "  Encrypted: FAILED - $($_.Exception.Message.Substring(0, [Math]::Min(100, $_.Exception.Message.Length)))..."
             } finally {
                 if($ConnEnc.State -eq 'Open') { $ConnEnc.Close() }
                 $ConnEnc.Dispose()
             }
         } catch {
             $WithEncryptError = $_.Exception.Message
+            Write-Verbose "  Encrypted: ERROR - $($_.Exception.Message.Substring(0, [Math]::Min(100, $_.Exception.Message.Length)))..."
         }
         
         # Analyze results
+        Write-Verbose "  Analyzing results..."
         if($NoEncryptSuccess) {
             # Non-encrypted connection succeeded = encryption NOT enforced
             $EncryptionStatus = "No"
-            Write-Verbose "Encryption NOT enforced - Vulnerable to NTLM relay"
+            Write-Verbose "RESULT: Encryption NOT enforced - Vulnerable to NTLM relay"
         } elseif($NoEncryptError -match "Login failed|Authentication") {
             # Got to login phase without encryption = encryption NOT enforced
             $EncryptionStatus = "No"
-            Write-Verbose "Encryption NOT enforced - Vulnerable to NTLM relay"
+            Write-Verbose "RESULT: Encryption NOT enforced - Vulnerable to NTLM relay (reached auth)"
         } elseif($WithEncryptSuccess -and ($NoEncryptError -match "timeout|not accessible|not found")) {
             # Encrypted works but non-encrypted times out = encryption IS enforced
             $EncryptionStatus = "Yes"
-            Write-Verbose "Encryption IS enforced - Protected (non-encrypted timed out, encrypted succeeded)"
+            Write-Verbose "RESULT: Encryption IS enforced - Protected (non-encrypted timed out, encrypted succeeded)"
         } elseif($NoEncryptError -match "encrypt|SSL|certificate") {
             # Explicit encryption error = encryption IS enforced
             $EncryptionStatus = "Yes"
-            Write-Verbose "Encryption IS enforced - Protected"
-        } elseif($NoEncryptError -match "timeout|not accessible|not found" -and $WithEncryptError -match "Login failed|Authentication") {
+            Write-Verbose "RESULT: Encryption IS enforced - Protected (explicit encryption required)"
+        } elseif($NoEncryptError -match "timeout|not accessible|not found" -and ($WithEncryptError -match "Login failed|Authentication")) {
             # Non-encrypted times out, encrypted gets to login = encryption IS enforced
             $EncryptionStatus = "Yes"
-            Write-Verbose "Encryption IS enforced - Protected (non-encrypted timed out, encrypted reached auth)"
-        } elseif($NoEncryptError -match "timeout|not accessible|not found") {
-            # Both timed out or connection failed
+            Write-Verbose "RESULT: Encryption IS enforced - Protected (non-encrypted timed out, encrypted reached auth)"
+        } elseif(($NoEncryptError -match "timeout|not accessible|not found") -and (($WithEncryptSuccess) -or ($WithEncryptError -notmatch "timeout|not accessible|not found"))) {
+            # Non-encrypted times out, but encrypted behaved differently = likely enforced
+            $EncryptionStatus = "Yes"
+            Write-Verbose "RESULT: Encryption IS enforced - Protected (non-encrypted timed out, encrypted behaved differently)"
+        } elseif($NoEncryptError -match "timeout|not accessible|not found" -and $WithEncryptError -match "timeout|not accessible|not found") {
+            # Both timed out
             $EncryptionStatus = "Unknown"
-            Write-Verbose "Could not determine - connection timeout/failure on both tests"
+            Write-Verbose "RESULT: Could not determine - both connection attempts timed out"
         } else {
             $EncryptionStatus = "Unknown"
-            Write-Verbose "Could not determine: $NoEncryptError"
+            Write-Verbose "RESULT: Could not determine - unexpected error pattern"
         }
         
         # Add to results
