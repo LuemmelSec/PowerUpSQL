@@ -16737,7 +16737,7 @@ Function Get-SQLEncryptionStatus
                     0x02, 0x00, 0x21, 0x00, 0x01,  # INSTOPT option: offset 0x0021, length 1
                     0x03, 0x00, 0x22, 0x00, 0x04,  # THREADID option: offset 0x0022, length 4
                     0xFF,                           # TERMINATOR
-                    0x09, 0x00, 0x00, 0x00, 0x00, 0x00  # VERSION value (9.0.0.0)
+                    0x09, 0x00, 0x00, 0x00, 0x00, 0x00, # VERSION value (9.0.0.0)
                     0x00,                           # ENCRYPTION value: 0x00 = NOT required (we request no encryption)
                     0x00,                           # INSTOPT value
                     0x00, 0x00, 0x00, 0x00          # THREADID value
