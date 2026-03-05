@@ -16731,11 +16731,12 @@ Function Get-SQLEncryptionStatus
                 # Pre-Login Options: VERSION, ENCRYPTION, INSTOPT, THREADID, MARS, TRACEID, FEDAUTHREQUIRED, TERMINATOR
                 
                 # Pre-login payload with ENCRYPTION option
+                # Offsets are from start of packet (header=8 bytes + option table=21 bytes = data starts at byte 29/0x1D)
                 $PreLoginPayload = @(
-                    0x00, 0x00, 0x1A, 0x00, 0x06,  # VERSION option: offset 0x001A, length 6
-                    0x01, 0x00, 0x20, 0x00, 0x01,  # ENCRYPTION option: offset 0x0020, length 1 (this is what we care about!)
-                    0x02, 0x00, 0x21, 0x00, 0x01,  # INSTOPT option: offset 0x0021, length 1
-                    0x03, 0x00, 0x22, 0x00, 0x04,  # THREADID option: offset 0x0022, length 4
+                    0x00, 0x00, 0x1D, 0x00, 0x06,  # VERSION option: offset 0x001D (29), length 6
+                    0x01, 0x00, 0x23, 0x00, 0x01,  # ENCRYPTION option: offset 0x0023 (35), length 1 (this is what we care about!)
+                    0x02, 0x00, 0x24, 0x00, 0x01,  # INSTOPT option: offset 0x0024 (36), length 1
+                    0x03, 0x00, 0x25, 0x00, 0x04,  # THREADID option: offset 0x0025 (37), length 4
                     0xFF,                           # TERMINATOR
                     0x09, 0x00, 0x00, 0x00, 0x00, 0x00, # VERSION value (9.0.0.0)
                     0x00,                           # ENCRYPTION value: 0x00 = NOT required (we request no encryption)
