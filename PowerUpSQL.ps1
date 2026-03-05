@@ -16500,6 +16500,155 @@ Function  Get-SQLInstanceDomain
 
 
 # -------------------------------------------
+# Function:  Get-SQLEncryptionStatus
+# -------------------------------------------
+# Author: Community Contribution
+# Reference: https://blog.compass-security.com/2023/10/relaying-ntlm-to-mssql/
+Function Get-SQLEncryptionStatus
+{
+    <#
+            .SYNOPSIS
+            Tests whether encryption is enforced on a specific SQL Server instance. 
+            Useful for identifying instances vulnerable to NTLM relay attacks.
+            
+            .PARAMETER Instance
+            SQL Server instance to test (e.g., "Server\Instance", "Server,1433", or "Server").
+            
+            .PARAMETER TimeOut
+            Connection timeout in seconds. Default is 3.
+            
+            .EXAMPLE
+            PS C:\> Get-SQLEncryptionStatus -Instance "SQLServer1.domain.com" -Verbose
+            VERBOSE: Testing encryption on SQLServer1.domain.com:1433...
+            VERBOSE: Encryption NOT enforced - Vulnerable to NTLM relay
+
+            Instance                  EncryptionEnforced
+            --------                  ------------------
+            SQLServer1.domain.com     No
+
+            .EXAMPLE
+            PS C:\> Get-SQLEncryptionStatus -Instance "SQLServer1\SQLEXPRESS"
+            
+            Tests a named instance (will attempt UDP scan to resolve port).
+            
+            .EXAMPLE
+            PS C:\> "Server1", "Server2\SQL01", "Server3,14330" | Get-SQLEncryptionStatus
+            
+            Test multiple instances via pipeline.
+    #>
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true,
+                ValueFromPipeline = $true,
+                ValueFromPipelineByPropertyName = $true,
+        HelpMessage = 'SQL Server instance to test.')]
+        [string]$Instance,
+        
+        [Parameter(Mandatory = $false,
+        HelpMessage = 'Connection timeout in seconds.')]
+        [int]$TimeOut = 3
+    )
+    
+    Begin
+    {
+        # Setup data table for results
+        $TblResults = New-Object -TypeName System.Data.DataTable
+        $null = $TblResults.Columns.Add('Instance')
+        $null = $TblResults.Columns.Add('EncryptionEnforced')
+    }
+    
+    Process
+    {
+        # Parse instance to get computer and port
+        $Computer = $Instance
+        $Port = 1433
+        
+        if($Instance -match '\\')
+        {
+            # Named instance
+            $Computer = $Instance.Split('\')[0]
+            $InstanceName = $Instance.Split('\')[1]
+            
+            # Try UDP scan to get port
+            Write-Verbose "Resolving port for named instance $Instance..."
+            try {
+                $UDPResult = Get-SQLInstanceScanUDP -ComputerName $Computer -SuppressVerbose | 
+                             Where-Object {$_.InstanceName -eq $InstanceName} | 
+                             Select-Object -First 1
+                             
+                if($UDPResult -and $UDPResult.TCPPort) {
+                    $Port = $UDPResult.TCPPort
+                    Write-Verbose "Resolved to port $Port"
+                } else {
+                    Write-Verbose "Could not resolve port via UDP scan"
+                    $null = $TblResults.Rows.Add($Instance, "Unknown (Port Resolution Failed)")
+                    return
+                }
+            } catch {
+                Write-Verbose "Error resolving port: $_"
+                $null = $TblResults.Rows.Add($Instance, "Unknown (Port Resolution Failed)")
+                return
+            }
+        }
+        elseif($Instance -match ',')
+        {
+            # Port specified
+            $Computer = $Instance.Split(',')[0]
+            $Port = $Instance.Split(',')[1]
+        }
+        
+        Write-Verbose "Testing encryption on ${Computer}:${Port}..."
+        
+        # Test connection WITHOUT encryption
+        $EncryptionStatus = "Unknown"
+        
+        try {
+            $ConnStr = "Server=$Computer,$Port;Connection Timeout=$TimeOut;Encrypt=False;"
+            $Conn = New-Object System.Data.SqlClient.SqlConnection($ConnStr)
+            $Success = $false
+            
+            try {
+                $Conn.Open()
+                $Success = $true
+                $Conn.Close()
+            } catch {
+                $ErrorMsg = $_.Exception.Message
+            } finally {
+                if($Conn.State -eq 'Open') { $Conn.Close() }
+                $Conn.Dispose()
+            }
+            
+            # Analyze result
+            if($Success) {
+                $EncryptionStatus = "No"
+                Write-Verbose "Encryption NOT enforced - Vulnerable to NTLM relay"
+            } elseif($ErrorMsg -match "Login failed|Authentication") {
+                $EncryptionStatus = "No"
+                Write-Verbose "Encryption NOT enforced - Vulnerable to NTLM relay"
+            } elseif($ErrorMsg -match "encrypt|SSL|certificate") {
+                $EncryptionStatus = "Yes"
+                Write-Verbose "Encryption IS enforced - Protected"
+            } else {
+                $EncryptionStatus = "Unknown"
+                Write-Verbose "Could not determine: $ErrorMsg"
+            }
+        } catch {
+            $EncryptionStatus = "Unknown"
+            Write-Verbose "Error testing instance: $_"
+        }
+        
+        # Add to results
+        $null = $TblResults.Rows.Add($Instance, $EncryptionStatus)
+    }
+    
+    End
+    {
+        return $TblResults
+    }
+}
+
+
+# -------------------------------------------
 # Function:  Get-SQLInstanceLocal
 # -------------------------------------------
 # Author: Scott Sutherland
