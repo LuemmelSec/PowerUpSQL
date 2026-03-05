@@ -16414,58 +16414,87 @@ Function  Get-SQLInstanceDomain
                 if($TestPort -and $EncryptionStatus -eq "Unknown")
                 {
                     try {
-                        # Try connection WITHOUT encryption
-                        $ConnStrNoEnc = "Server=$TestComputer,$TestPort;Connection Timeout=3;Encrypt=False;"
-                        $ConnNoEnc = New-Object System.Data.SqlClient.SqlConnection($ConnStrNoEnc)
-                        $NoEncSuccess = $false
-                        $NoEncError = ""
-                        try {
-                            $ConnNoEnc.Open()
-                            $NoEncSuccess = $true
-                            $ConnNoEnc.Close()
-                        } catch {
-                            $NoEncError = $_.Exception.Message
-                        } finally {
-                            if($ConnNoEnc.State -eq 'Open') { $ConnNoEnc.Close() }
-                            $ConnNoEnc.Dispose()
-                        }
+                        # Use TDS pre-login to test encryption enforcement
+                        $TcpClient = New-Object System.Net.Sockets.TcpClient
+                        $ConnectTask = $TcpClient.ConnectAsync($TestComputer, $TestPort)
                         
-                        # Try connection WITH encryption
-                        $ConnStrEnc = "Server=$TestComputer,$TestPort;Connection Timeout=3;Encrypt=True;TrustServerCertificate=True;"
-                        $ConnEnc = New-Object System.Data.SqlClient.SqlConnection($ConnStrEnc)
-                        $WithEncSuccess = $false
-                        $WithEncError = ""
-                        try {
-                            $ConnEnc.Open()
-                            $WithEncSuccess = $true
-                            $ConnEnc.Close()
-                        } catch {
-                            $WithEncError = $_.Exception.Message
-                        } finally {
-                            if($ConnEnc.State -eq 'Open') { $ConnEnc.Close() }
-                            $ConnEnc.Dispose()
-                        }
-                        
-                        # Analyze results
-                        if($NoEncSuccess) {
-                            # Non-encrypted worked = not enforced
-                            $EncryptionStatus = "No"
-                        } elseif($NoEncError -match "Login failed|Authentication") {
-                            # Got to auth without encryption = not enforced
-                            $EncryptionStatus = "No"
-                        } elseif($WithEncSuccess -and ($NoEncError -match "timeout|not accessible|not found")) {
-                            # Encrypted works but non-encrypted times out = enforced
-                            $EncryptionStatus = "Yes"
-                        } elseif($NoEncError -match "encrypt|SSL|certificate") {
-                            $EncryptionStatus = "Yes"
-                        } elseif($NoEncError -match "timeout|not accessible|not found" -and $WithEncError -match "Login failed|Authentication") {
-                            # Non-encrypted times out, encrypted gets to login = enforced
-                            $EncryptionStatus = "Yes"
+                        if($ConnectTask.Wait(3000)) {
+                            $Stream = $TcpClient.GetStream()
+                            $Stream.ReadTimeout = 3000
+                            $Stream.WriteTimeout = 3000
+                            
+                            # TDS pre-login packet
+                            $PreLoginPayload = @(
+                                0x00, 0x00, 0x1A, 0x00, 0x06,
+                                0x01, 0x00, 0x20, 0x00, 0x01,
+                                0x02, 0x00, 0x21, 0x00, 0x01,
+                                0x03, 0x00, 0x22, 0x00, 0x04,
+                                0xFF,
+                                0x09, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00,
+                                0x00,
+                                0x00, 0x00, 0x00, 0x00
+                            )
+                            
+                            $PayloadLength = $PreLoginPayload.Length
+                            $TotalLength = 8 + $PayloadLength
+                            
+                            $TdsPacket = @(
+                                0x12, 0x01,
+                                ([byte]($TotalLength -shr 8)),
+                                ([byte]($TotalLength -band 0xFF)),
+                                0x00, 0x00, 0x00, 0x00
+                            ) + $PreLoginPayload
+                            
+                            $Stream.Write($TdsPacket, 0, $TdsPacket.Length)
+                            $Stream.Flush()
+                            
+                            $ResponseHeader = New-Object byte[] 8
+                            $BytesRead = $Stream.Read($ResponseHeader, 0, 8)
+                            
+                            if($BytesRead -eq 8) {
+                                $ResponseLength = ([int]$ResponseHeader[2] -shl 8) + [int]$ResponseHeader[3]
+                                $ResponsePayload = New-Object byte[] ($ResponseLength - 8)
+                                $BytesRead = $Stream.Read($ResponsePayload, 0, $ResponsePayload.Length)
+                                
+                                # Find ENCRYPTION option
+                                $i = 0
+                                $EncryptionOffset = -1
+                                
+                                while($i -lt $ResponsePayload.Length) {
+                                    $OptionType = $ResponsePayload[$i]
+                                    if($OptionType -eq 0xFF) { break }
+                                    if($OptionType -eq 0x01) {
+                                        $EncryptionOffset = ([int]$ResponsePayload[$i+1] -shl 8) + [int]$ResponsePayload[$i+2]
+                                        break
+                                    }
+                                    $i += 5
+                                }
+                                
+                                if($EncryptionOffset -ge 0 -and $EncryptionOffset -lt $ResponsePayload.Length) {
+                                    $EncryptionValue = $ResponsePayload[$EncryptionOffset - 8]
+                                    
+                                    switch($EncryptionValue) {
+                                        0x00 { $EncryptionStatus = "No" }   # ENCRYPT_OFF
+                                        0x01 { $EncryptionStatus = "Yes" }  # ENCRYPT_ON
+                                        0x02 { $EncryptionStatus = "No" }   # ENCRYPT_NOT_SUP
+                                        0x03 { $EncryptionStatus = "No" }   # ENCRYPT_REQ
+                                        default { $EncryptionStatus = "Unknown" }
+                                    }
+                                }
+                            }
+                            
+                            $Stream.Close()
+                            $TcpClient.Close()
                         } else {
                             $EncryptionStatus = "Unknown"
                         }
                     } catch {
                         $EncryptionStatus = "Unknown"
+                    } finally {
+                        if($TcpClient -and $TcpClient.Connected) {
+                            $TcpClient.Close()
+                        }
                     }
                 }
                 
@@ -16621,94 +16650,144 @@ Function Get-SQLEncryptionStatus
             $Port = $Instance.Split(',')[1]
         }
         
-        Write-Verbose "Testing encryption on ${Computer}:${Port}..."
+        Write-Verbose "Testing encryption on ${Computer}:${Port} using TDS pre-login..."
         
-        # Test connection WITHOUT encryption
+        # Test using TDS pre-login packet (like mssqlrelay does)
         $EncryptionStatus = "Unknown"
-        $NoEncryptSuccess = $false
-        $NoEncryptError = ""
         
-        Write-Verbose "  Testing without encryption..."
         try {
-            $ConnStr = "Server=$Computer,$Port;Connection Timeout=$TimeOut;Encrypt=False;"
-            $Conn = New-Object System.Data.SqlClient.SqlConnection($ConnStr)
+            # Create TCP connection
+            $TcpClient = New-Object System.Net.Sockets.TcpClient
+            $ConnectTask = $TcpClient.ConnectAsync($Computer, $Port)
+            $TimeoutMs = $TimeOut * 1000
             
-            try {
-                $Conn.Open()
-                $NoEncryptSuccess = $true
-                $Conn.Close()
-                Write-Verbose "  Non-encrypted: SUCCESS"
-            } catch {
-                $NoEncryptError = $_.Exception.Message
-                Write-Verbose "  Non-encrypted: FAILED - $($_.Exception.Message.Substring(0, [Math]::Min(100, $_.Exception.Message.Length)))..."
-            } finally {
-                if($Conn.State -eq 'Open') { $Conn.Close() }
-                $Conn.Dispose()
+            if($ConnectTask.Wait($TimeoutMs)) {
+                Write-Verbose "  TCP connection established"
+                $Stream = $TcpClient.GetStream()
+                $Stream.ReadTimeout = $TimeoutMs
+                $Stream.WriteTimeout = $TimeoutMs
+                
+                # Build TDS pre-login packet
+                # TDS Header: Type=0x12 (Pre-Login), Status=0x01 (End of message), Length, SPID=0x0000, PacketID=0x00, Window=0x00
+                # Pre-Login Options: VERSION, ENCRYPTION, INSTOPT, THREADID, MARS, TRACEID, FEDAUTHREQUIRED, TERMINATOR
+                
+                # Pre-login payload with ENCRYPTION option
+                $PreLoginPayload = @(
+                    0x00, 0x00, 0x1A, 0x00, 0x06,  # VERSION option: offset 0x001A, length 6
+                    0x01, 0x00, 0x20, 0x00, 0x01,  # ENCRYPTION option: offset 0x0020, length 1 (this is what we care about!)
+                    0x02, 0x00, 0x21, 0x00, 0x01,  # INSTOPT option: offset 0x0021, length 1
+                    0x03, 0x00, 0x22, 0x00, 0x04,  # THREADID option: offset 0x0022, length 4
+                    0xFF,                           # TERMINATOR
+                    0x09, 0x00, 0x00, 0x00, 0x00, 0x00  # VERSION value (9.0.0.0)
+                    0x00,                           # ENCRYPTION value: 0x00 = NOT required (we request no encryption)
+                    0x00,                           # INSTOPT value
+                    0x00, 0x00, 0x00, 0x00          # THREADID value
+                )
+                
+                $PayloadLength = $PreLoginPayload.Length
+                $TotalLength = 8 + $PayloadLength
+                
+                # TDS Header
+                $TdsPacket = @(
+                    0x12,                                    # Type: Pre-Login
+                    0x01,                                    # Status: End of message
+                    ([byte]($TotalLength -shr 8)),          # Length high byte
+                    ([byte]($TotalLength -band 0xFF)),      # Length low byte
+                    0x00, 0x00,                              # SPID
+                    0x00,                                    # PacketID
+                    0x00                                     # Window
+                ) + $PreLoginPayload
+                
+                # Send pre-login packet
+                Write-Verbose "  Sending TDS pre-login packet..."
+                $Stream.Write($TdsPacket, 0, $TdsPacket.Length)
+                $Stream.Flush()
+                
+                # Read response
+                Write-Verbose "  Reading TDS pre-login response..."
+                $ResponseHeader = New-Object byte[] 8
+                $BytesRead = $Stream.Read($ResponseHeader, 0, 8)
+                
+                if($BytesRead -eq 8) {
+                    $ResponseLength = ([int]$ResponseHeader[2] -shl 8) + [int]$ResponseHeader[3]
+                    $ResponsePayload = New-Object byte[] ($ResponseLength - 8)
+                    $BytesRead = $Stream.Read($ResponsePayload, 0, $ResponsePayload.Length)
+                    
+                    # Parse pre-login response to find ENCRYPTION option
+                    Write-Verbose "  Parsing encryption flag from response..."
+                    $i = 0
+                    $EncryptionOffset = -1
+                    
+                    while($i -lt $ResponsePayload.Length) {
+                        $OptionType = $ResponsePayload[$i]
+                        
+                        if($OptionType -eq 0xFF) {
+                            # Terminator found
+                            break
+                        }
+                        
+                        if($OptionType -eq 0x01) {
+                            # ENCRYPTION option found
+                            $EncryptionOffset = ([int]$ResponsePayload[$i+1] -shl 8) + [int]$ResponsePayload[$i+2]
+                            break
+                        }
+                        
+                        $i += 5  # Move to next option (type + offset[2] + length[2])
+                    }
+                    
+                    if($EncryptionOffset -ge 0 -and $EncryptionOffset -lt $ResponsePayload.Length) {
+                        $EncryptionValue = $ResponsePayload[$EncryptionOffset - 8]  # Adjust for header
+                        
+                        Write-Verbose "  Encryption flag value: 0x$($EncryptionValue.ToString('X2'))"
+                        
+                        switch($EncryptionValue) {
+                            0x00 { 
+                                # ENCRYPT_OFF - Encryption available but not required
+                                $EncryptionStatus = "No"
+                                Write-Verbose "RESULT: Encryption NOT enforced - Vulnerable to NTLM relay"
+                            }
+                            0x01 { 
+                                # ENCRYPT_ON - Encryption required
+                                $EncryptionStatus = "Yes"
+                                Write-Verbose "RESULT: Encryption IS enforced - Protected"
+                            }
+                            0x02 { 
+                                # ENCRYPT_NOT_SUP - Encryption not supported
+                                $EncryptionStatus = "No"
+                                Write-Verbose "RESULT: Encryption not supported - Vulnerable to NTLM relay"
+                            }
+                            0x03 { 
+                                # ENCRYPT_REQ - Client requested encryption
+                                $EncryptionStatus = "No"
+                                Write-Verbose "RESULT: Encryption NOT enforced (only client-requested) - Vulnerable to NTLM relay"
+                            }
+                            default {
+                                $EncryptionStatus = "Unknown"
+                                Write-Verbose "RESULT: Unknown encryption value: 0x$($EncryptionValue.ToString('X2'))"
+                            }
+                        }
+                    } else {
+                        $EncryptionStatus = "Unknown"
+                        Write-Verbose "RESULT: Could not find encryption option in response"
+                    }
+                } else {
+                    $EncryptionStatus = "Unknown"
+                    Write-Verbose "RESULT: Invalid response from server"
+                }
+                
+                $Stream.Close()
+                $TcpClient.Close()
+            } else {
+                $EncryptionStatus = "Unknown"
+                Write-Verbose "RESULT: Connection timeout - server not reachable"
             }
         } catch {
-            $NoEncryptError = $_.Exception.Message
-            Write-Verbose "  Non-encrypted: ERROR - $($_.Exception.Message.Substring(0, [Math]::Min(100, $_.Exception.Message.Length)))..."
-        }
-        
-        # Test connection WITH encryption
-        $WithEncryptSuccess = $false
-        $WithEncryptError = ""
-        
-        Write-Verbose "  Testing with encryption..."
-        try {
-            $ConnStrEnc = "Server=$Computer,$Port;Connection Timeout=$TimeOut;Encrypt=True;TrustServerCertificate=True;"
-            $ConnEnc = New-Object System.Data.SqlClient.SqlConnection($ConnStrEnc)
-            
-            try {
-                $ConnEnc.Open()
-                $WithEncryptSuccess = $true
-                $ConnEnc.Close()
-                Write-Verbose "  Encrypted: SUCCESS"
-            } catch {
-                $WithEncryptError = $_.Exception.Message
-                Write-Verbose "  Encrypted: FAILED - $($_.Exception.Message.Substring(0, [Math]::Min(100, $_.Exception.Message.Length)))..."
-            } finally {
-                if($ConnEnc.State -eq 'Open') { $ConnEnc.Close() }
-                $ConnEnc.Dispose()
+            $EncryptionStatus = "Unknown"
+            Write-Verbose "RESULT: Error - $($_.Exception.Message)"
+        } finally {
+            if($TcpClient -and $TcpClient.Connected) {
+                $TcpClient.Close()
             }
-        } catch {
-            $WithEncryptError = $_.Exception.Message
-            Write-Verbose "  Encrypted: ERROR - $($_.Exception.Message.Substring(0, [Math]::Min(100, $_.Exception.Message.Length)))..."
-        }
-        
-        # Analyze results
-        Write-Verbose "  Analyzing results..."
-        if($NoEncryptSuccess) {
-            # Non-encrypted connection succeeded = encryption NOT enforced
-            $EncryptionStatus = "No"
-            Write-Verbose "RESULT: Encryption NOT enforced - Vulnerable to NTLM relay"
-        } elseif($NoEncryptError -match "Login failed|Authentication") {
-            # Got to login phase without encryption = encryption NOT enforced
-            $EncryptionStatus = "No"
-            Write-Verbose "RESULT: Encryption NOT enforced - Vulnerable to NTLM relay (reached auth)"
-        } elseif($WithEncryptSuccess -and ($NoEncryptError -match "timeout|not accessible|not found")) {
-            # Encrypted works but non-encrypted times out = encryption IS enforced
-            $EncryptionStatus = "Yes"
-            Write-Verbose "RESULT: Encryption IS enforced - Protected (non-encrypted timed out, encrypted succeeded)"
-        } elseif($NoEncryptError -match "encrypt|SSL|certificate") {
-            # Explicit encryption error = encryption IS enforced
-            $EncryptionStatus = "Yes"
-            Write-Verbose "RESULT: Encryption IS enforced - Protected (explicit encryption required)"
-        } elseif($NoEncryptError -match "timeout|not accessible|not found" -and ($WithEncryptError -match "Login failed|Authentication")) {
-            # Non-encrypted times out, encrypted gets to login = encryption IS enforced
-            $EncryptionStatus = "Yes"
-            Write-Verbose "RESULT: Encryption IS enforced - Protected (non-encrypted timed out, encrypted reached auth)"
-        } elseif(($NoEncryptError -match "timeout|not accessible|not found") -and (($WithEncryptSuccess) -or ($WithEncryptError -notmatch "timeout|not accessible|not found"))) {
-            # Non-encrypted times out, but encrypted behaved differently = likely enforced
-            $EncryptionStatus = "Yes"
-            Write-Verbose "RESULT: Encryption IS enforced - Protected (non-encrypted timed out, encrypted behaved differently)"
-        } elseif($NoEncryptError -match "timeout|not accessible|not found" -and $WithEncryptError -match "timeout|not accessible|not found") {
-            # Both timed out
-            $EncryptionStatus = "Unknown"
-            Write-Verbose "RESULT: Could not determine - both connection attempts timed out"
-        } else {
-            $EncryptionStatus = "Unknown"
-            Write-Verbose "RESULT: Could not determine - unexpected error pattern"
         }
         
         # Add to results
