@@ -16179,6 +16179,8 @@ Function  Get-SQLInstanceDomain
             Domain account to filter for.
             .PARAMETER CheckMgmt
             Performs UDP scan of servers with registered MSServerClusterMgmtAPI SPNs to help find additional SQL Server instances.
+            .PARAMETER CheckEncryption
+            Tests each instance to determine if encryption is enforced. Useful for identifying NTLM relay targets.
             .PARAMETER UDPTimeOut
             Timeout in seconds for UDP scans of management servers. Longer timeout = more accurate.
             .EXAMPLE
@@ -16276,6 +16278,11 @@ Function  Get-SQLInstanceDomain
 
         [Parameter(Mandatory = $false,
                 ValueFromPipelineByPropertyName = $true,
+        HelpMessage = 'Tests encryption enforcement (NTLM relay vulnerability check).')]
+        [switch]$CheckEncryption,
+
+        [Parameter(Mandatory = $false,
+                ValueFromPipelineByPropertyName = $true,
         HelpMessage = 'Preforms a DNS lookup on the instance.')]
         [switch]$IncludeIP,
 
@@ -16302,6 +16309,11 @@ Function  Get-SQLInstanceDomain
         if($IncludeIP)
         {
             $null = $TblSQLServerSpns.Columns.Add('IPAddress')
+        }
+        
+        if($CheckEncryption)
+        {
+            $null = $TblSQLServerSpns.Columns.Add('EncryptionEnforced')
         }
         # Table for UDP scan results of management servers
     }
@@ -16361,6 +16373,80 @@ Function  Get-SQLInstanceDomain
                     $IPAddress = "0.0.0.0"
                 }
                 $TableRow += $IPAddress
+            }
+            
+            # Check encryption enforcement if requested
+            if($CheckEncryption)
+            {
+                Write-Verbose -Message "Testing encryption on $SpnServerInstance..."
+                $EncryptionStatus = "Unknown"
+                
+                # Determine port
+                $TestPort = 1433
+                if($SpnServerInstance -match ',')
+                {
+                    $TestPort = $SpnServerInstance.Split(',')[1]
+                    $TestComputer = $SpnServerInstance.Split(',')[0]
+                }
+                elseif($SpnServerInstance -match '\\')
+                {
+                    # Named instance - try UDP scan to get port
+                    $TestComputer = $SpnServerInstance.Split('\\')[0]
+                    $TestInstanceName = $SpnServerInstance.Split('\\')[1]
+                    try {
+                        $UDPResult = Get-SQLInstanceScanUDP -ComputerName $TestComputer -SuppressVerbose | 
+                                     Where-Object {$_.InstanceName -eq $TestInstanceName} | 
+                                     Select-Object -First 1
+                        if($UDPResult -and $UDPResult.TCPPort) {
+                            $TestPort = $UDPResult.TCPPort
+                        }
+                    } catch {
+                        # UDP scan failed, skip encryption test
+                        $EncryptionStatus = "Unknown (Port Resolution Failed)"
+                    }
+                }
+                else
+                {
+                    $TestComputer = $SpnServerInstance
+                }
+                
+                # Test encryption if we have a port
+                if($TestPort -and $EncryptionStatus -eq "Unknown")
+                {
+                    try {
+                        # Try connection WITHOUT encryption
+                        $ConnStrNoEnc = "Server=$TestComputer,$TestPort;Connection Timeout=3;Encrypt=False;"
+                        $ConnNoEnc = New-Object System.Data.SqlClient.SqlConnection($ConnStrNoEnc)
+                        $NoEncSuccess = $false
+                        try {
+                            $ConnNoEnc.Open()
+                            $NoEncSuccess = $true
+                            $ConnNoEnc.Close()
+                        } catch {
+                            $NoEncError = $_.Exception.Message
+                        } finally {
+                            if($ConnNoEnc.State -eq 'Open') { $ConnNoEnc.Close() }
+                            $ConnNoEnc.Dispose()
+                        }
+                        
+                        # Analyze result
+                        if($NoEncSuccess) {
+                            $EncryptionStatus = "No"
+                        } elseif($NoEncError -match "Login failed|Authentication") {
+                            # Got to auth phase without encryption = not enforced
+                            $EncryptionStatus = "No"
+                        } elseif($NoEncError -match "encrypt|SSL|certificate") {
+                            $EncryptionStatus = "Yes"
+                        } else {
+                            $EncryptionStatus = "Unknown"
+                        }
+                    } catch {
+                        $EncryptionStatus = "Unknown"
+                    }
+                }
+                
+                $TableRow += $EncryptionStatus
+                Write-Verbose -Message "  Encryption Enforced: $EncryptionStatus"
             }
 
             # Add SQL Server spn to table
