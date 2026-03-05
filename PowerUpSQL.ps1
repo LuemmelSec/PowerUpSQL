@@ -16293,6 +16293,24 @@ Function  Get-SQLInstanceDomain
 
         [Parameter(Mandatory = $false,
                 ValueFromPipelineByPropertyName = $true,
+        HelpMessage = 'Perform quick audit: test login, get version, database, privileges, and sysadmin status.')]
+        [switch]$QuickAudit,
+
+        [Parameter(Mandatory = $false,
+        HelpMessage = 'SQL Server login username for QuickAudit authentication.')]
+        [string]$SQLUsername,
+
+        [Parameter(Mandatory = $false,
+        HelpMessage = 'SQL Server login password for QuickAudit authentication.')]
+        [string]$SQLPassword,
+
+        [Parameter(Mandatory = $false,
+        HelpMessage = 'SQL Server credentials for QuickAudit authentication.')]
+        [System.Management.Automation.PSCredential]
+        [System.Management.Automation.Credential()]$SQLCredential = [System.Management.Automation.PSCredential]::Empty,
+
+        [Parameter(Mandatory = $false,
+                ValueFromPipelineByPropertyName = $true,
         HelpMessage = 'Preforms a DNS lookup on the instance.')]
         [switch]$IncludeIP,
 
@@ -16324,6 +16342,18 @@ Function  Get-SQLInstanceDomain
         if($CheckEncryption)
         {
             $null = $TblSQLServerSpns.Columns.Add('EncryptionEnforced')
+        }
+        
+        if($QuickAudit)
+        {
+            $null = $TblSQLServerSpns.Columns.Add('LoginSuccess')
+            $null = $TblSQLServerSpns.Columns.Add('Version')
+            $null = $TblSQLServerSpns.Columns.Add('CurrentLogin')
+            $null = $TblSQLServerSpns.Columns.Add('CurrentDatabase')
+            $null = $TblSQLServerSpns.Columns.Add('IsSysadmin')
+            $null = $TblSQLServerSpns.Columns.Add('HasXpDirtree')
+            $null = $TblSQLServerSpns.Columns.Add('HasXpFileexist')
+            $null = $TblSQLServerSpns.Columns.Add('HasXpCmdshell')
         }
         # Table for UDP scan results of management servers
     }
@@ -16581,6 +16611,106 @@ Function  Get-SQLInstanceDomain
                 
                 $TableRow += $EncryptionStatus
                 Write-Verbose -Message "  Encryption Enforced: $EncryptionStatus"
+            }
+            
+            # Perform quick audit if requested
+            if($QuickAudit)
+            {
+                Write-Verbose -Message "Performing quick audit on $SpnServerInstance..."
+                
+                # Initialize audit values
+                $LoginSuccess = "No"
+                $VersionInfo = ""
+                $CurrentLogin = ""
+                $CurrentDatabase = ""
+                $IsSysadminStatus = "No"
+                $HasXpDirtree = "No"
+                $HasXpFileexist = "No"
+                $HasXpCmdshell = "No"
+                
+                # Test connection
+                $ConnTest = Get-SQLConnectionTest -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -SuppressVerbose
+                
+                if($ConnTest.Status -eq "Accessible")
+                {
+                    $LoginSuccess = "Yes"
+                    Write-Verbose -Message "  Login successful"
+                    
+                    # Get server information
+                    try {
+                        $ServerInfo = Get-SQLServerInfo -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -SuppressVerbose
+                        
+                        if($ServerInfo)
+                        {
+                            $VersionInfo = "$($ServerInfo.SQLServerMajorVersion) ($($ServerInfo.SQLServerVersionNumber))"
+                            $CurrentLogin = $ServerInfo.Currentlogin
+                            $IsSysadminStatus = $ServerInfo.IsSysadmin
+                            Write-Verbose -Message "  Version: $VersionInfo"
+                            Write-Verbose -Message "  Current Login: $CurrentLogin"
+                            Write-Verbose -Message "  SysAdmin: $IsSysadminStatus"
+                        }
+                    } catch {
+                        Write-Verbose -Message "  Error getting server info: $($_.Exception.Message)"
+                    }
+                    
+                    # Get current database
+                    try {
+                        $DBQuery = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "SELECT DB_NAME() as CurrentDB" -SuppressVerbose
+                        if($DBQuery) {
+                            $CurrentDatabase = $DBQuery.CurrentDB
+                            Write-Verbose -Message "  Database: $CurrentDatabase"
+                        }
+                    } catch {
+                        Write-Verbose -Message "  Error getting current database: $($_.Exception.Message)"
+                    }
+                    
+                    # Check xp_dirtree access
+                    try {
+                        $XpDirtreeTest = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_dirtree 'C:\',0,0" -SuppressVerbose -ErrorAction SilentlyContinue
+                        if($XpDirtreeTest -or $?) {
+                            $HasXpDirtree = "Yes"
+                            Write-Verbose -Message "  xp_dirtree: Available"
+                        }
+                    } catch {
+                        Write-Verbose -Message "  xp_dirtree: Not available"
+                    }
+                    
+                    # Check xp_fileexist access
+                    try {
+                        $XpFileexistTest = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_fileexist 'C:\Windows\win.ini'" -SuppressVerbose -ErrorAction SilentlyContinue
+                        if($XpFileexistTest -or $?) {
+                            $HasXpFileexist = "Yes"
+                            Write-Verbose -Message "  xp_fileexist: Available"
+                        }
+                    } catch {
+                        Write-Verbose -Message "  xp_fileexist: Not available"
+                    }
+                    
+                    # Check xp_cmdshell access
+                    try {
+                        $XpCmdshellTest = Get-SQLQuery -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_cmdshell 'echo test'" -SuppressVerbose -ErrorAction SilentlyContinue
+                        if($XpCmdshellTest -or $?) {
+                            $HasXpCmdshell = "Yes"
+                            Write-Verbose -Message "  xp_cmdshell: Available"
+                        }
+                    } catch {
+                        Write-Verbose -Message "  xp_cmdshell: Not available"
+                    }
+                }
+                else
+                {
+                    Write-Verbose -Message "  Login failed or instance not accessible"
+                }
+                
+                # Add audit results to table row
+                $TableRow += $LoginSuccess
+                $TableRow += $VersionInfo
+                $TableRow += $CurrentLogin
+                $TableRow += $CurrentDatabase
+                $TableRow += $IsSysadminStatus
+                $TableRow += $HasXpDirtree
+                $TableRow += $HasXpFileexist
+                $TableRow += $HasXpCmdshell
             }
 
             # Add SQL Server spn to table
@@ -16855,6 +16985,106 @@ Function  Get-SQLInstanceDomain
                         
                         $TableRow += $EncryptionStatus
                         Write-Verbose -Message "      Encryption Enforced: $EncryptionStatus"
+                    }
+                    
+                    # Perform quick audit if requested
+                    if($QuickAudit)
+                    {
+                        Write-Verbose -Message "      Performing quick audit on $($NewInstance.Instance)..."
+                        
+                        # Initialize audit values
+                        $LoginSuccess = "No"
+                        $VersionInfo = ""
+                        $CurrentLogin = ""
+                        $CurrentDatabase = ""
+                        $IsSysadminStatus = "No"
+                        $HasXpDirtree = "No"
+                        $HasXpFileexist = "No"
+                        $HasXpCmdshell = "No"
+                        
+                        # Test connection
+                        $ConnTest = Get-SQLConnectionTest -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -SuppressVerbose
+                        
+                        if($ConnTest.Status -eq "Accessible")
+                        {
+                            $LoginSuccess = "Yes"
+                            Write-Verbose -Message "        Login successful"
+                            
+                            # Get server information
+                            try {
+                                $ServerInfo = Get-SQLServerInfo -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -SuppressVerbose
+                                
+                                if($ServerInfo)
+                                {
+                                    $VersionInfo = "$($ServerInfo.SQLServerMajorVersion) ($($ServerInfo.SQLServerVersionNumber))"
+                                    $CurrentLogin = $ServerInfo.Currentlogin
+                                    $IsSysadminStatus = $ServerInfo.IsSysadmin
+                                    Write-Verbose -Message "        Version: $VersionInfo"
+                                    Write-Verbose -Message "        Current Login: $CurrentLogin"
+                                    Write-Verbose -Message "        SysAdmin: $IsSysadminStatus"
+                                }
+                            } catch {
+                                Write-Verbose -Message "        Error getting server info: $($_.Exception.Message)"
+                            }
+                            
+                            # Get current database
+                            try {
+                                $DBQuery = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "SELECT DB_NAME() as CurrentDB" -SuppressVerbose
+                                if($DBQuery) {
+                                    $CurrentDatabase = $DBQuery.CurrentDB
+                                    Write-Verbose -Message "        Database: $CurrentDatabase"
+                                }
+                            } catch {
+                                Write-Verbose -Message "        Error getting current database: $($_.Exception.Message)"
+                            }
+                            
+                            # Check xp_dirtree access
+                            try {
+                                $XpDirtreeTest = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_dirtree 'C:\',0,0" -SuppressVerbose -ErrorAction SilentlyContinue
+                                if($XpDirtreeTest -or $?) {
+                                    $HasXpDirtree = "Yes"
+                                    Write-Verbose -Message "        xp_dirtree: Available"
+                                }
+                            } catch {
+                                Write-Verbose -Message "        xp_dirtree: Not available"
+                            }
+                            
+                            # Check xp_fileexist access
+                            try {
+                                $XpFileexistTest = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_fileexist 'C:\Windows\win.ini'" -SuppressVerbose -ErrorAction SilentlyContinue
+                                if($XpFileexistTest -or $?) {
+                                    $HasXpFileexist = "Yes"
+                                    Write-Verbose -Message "        xp_fileexist: Available"
+                                }
+                            } catch {
+                                Write-Verbose -Message "        xp_fileexist: Not available"
+                            }
+                            
+                            # Check xp_cmdshell access
+                            try {
+                                $XpCmdshellTest = Get-SQLQuery -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -Query "EXEC master..xp_cmdshell 'echo test'" -SuppressVerbose -ErrorAction SilentlyContinue
+                                if($XpCmdshellTest -or $?) {
+                                    $HasXpCmdshell = "Yes"
+                                    Write-Verbose -Message "        xp_cmdshell: Available"
+                                }
+                            } catch {
+                                Write-Verbose -Message "        xp_cmdshell: Not available"
+                            }
+                        }
+                        else
+                        {
+                            Write-Verbose -Message "        Login failed or instance not accessible"
+                        }
+                        
+                        # Add audit results to table row
+                        $TableRow += $LoginSuccess
+                        $TableRow += $VersionInfo
+                        $TableRow += $CurrentLogin
+                        $TableRow += $CurrentDatabase
+                        $TableRow += $IsSysadminStatus
+                        $TableRow += $HasXpDirtree
+                        $TableRow += $HasXpFileexist
+                        $TableRow += $HasXpCmdshell
                     }
                     
                     # Add newly discovered instance to table
