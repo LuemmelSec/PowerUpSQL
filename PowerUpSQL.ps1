@@ -16628,6 +16628,154 @@ Function  Get-SQLInstanceDomain
                 $HasXpFileexist = "No"
                 $HasXpCmdshell = "No"
                 
+                # Get version via unauthenticated TDS pre-login (before authentication attempt)
+                $TestPort = 1433
+                $TestComputer = ""
+                if($SpnServerInstance -match ',')
+                {
+                    $TestPort = $SpnServerInstance.Split(',')[1]
+                    $TestComputer = $SpnServerInstance.Split(',')[0]
+                }
+                elseif($SpnServerInstance -match '\\')
+                {
+                    $TestComputer = $SpnServerInstance.Split('\\')[0]
+                    $TestInstanceName = $SpnServerInstance.Split('\\')[1]
+                    try {
+                        $UDPResult = Get-SQLInstanceScanUDP -ComputerName $TestComputer -SuppressVerbose | 
+                                     Where-Object {$_.InstanceName -eq $TestInstanceName} | 
+                                     Select-Object -First 1
+                        if($UDPResult -and $UDPResult.TCPPort) {
+                            $TestPort = $UDPResult.TCPPort
+                        }
+                    } catch { }
+                }
+                else
+                {
+                    $TestComputer = $SpnServerInstance
+                }
+                
+                # Try to get version via TDS pre-login
+                if($TestPort -and $TestComputer)
+                {
+                    $TcpClient = $null
+                    try {
+                        $TcpClient = New-Object System.Net.Sockets.TcpClient
+                        $ConnectResult = $TcpClient.BeginConnect($TestComputer, $TestPort, $null, $null)
+                        $WaitHandle = $ConnectResult.AsyncWaitHandle
+                        
+                        if($WaitHandle.WaitOne(5000, $false)) {
+                            try { $TcpClient.EndConnect($ConnectResult) } catch { }
+                        }
+                        
+                        if($TcpClient.Connected) {
+                            $Stream = $TcpClient.GetStream()
+                            $Stream.ReadTimeout = 5000
+                            $Stream.WriteTimeout = 3000
+                            
+                            # Build TDS pre-login packet
+                            $Version = @(0x08, 0x00, 0x01, 0x55, 0x00, 0x00)
+                            $EncryptionValue = @(0x02)
+                            $InstanceBytes = [System.Text.Encoding]::ASCII.GetBytes("MSSQLServer`0")
+                            $ThreadIDBytes = [BitConverter]::GetBytes([uint32](Get-Random -Maximum 65535))
+                            
+                            $VersionOffset = 21
+                            $EncryptionOffset = $VersionOffset + $Version.Length
+                            $InstanceOffset = $EncryptionOffset + $EncryptionValue.Length
+                            $ThreadIDOffset = $InstanceOffset + $InstanceBytes.Length
+                            
+                            $PreLoginOptions = @(
+                                0x00, ([byte]($VersionOffset -shr 8)), ([byte]($VersionOffset -band 0xFF)),
+                                ([byte]($Version.Length -shr 8)), ([byte]($Version.Length -band 0xFF)),
+                                0x01, ([byte]($EncryptionOffset -shr 8)), ([byte]($EncryptionOffset -band 0xFF)), 0x00, 0x01,
+                                0x02, ([byte]($InstanceOffset -shr 8)), ([byte]($InstanceOffset -band 0xFF)),
+                                ([byte]($InstanceBytes.Length -shr 8)), ([byte]($InstanceBytes.Length -band 0xFF)),
+                                0x03, ([byte]($ThreadIDOffset -shr 8)), ([byte]($ThreadIDOffset -band 0xFF)), 0x00, 0x04,
+                                0xFF
+                            )
+                            
+                            $PreLoginData = [System.Collections.ArrayList]@()
+                            $null = $PreLoginData.AddRange($Version)
+                            $null = $PreLoginData.AddRange($EncryptionValue)
+                            $null = $PreLoginData.AddRange($InstanceBytes)
+                            $null = $PreLoginData.AddRange($ThreadIDBytes)
+                            
+                            $PreLoginPayload = [System.Collections.ArrayList]@()
+                            $null = $PreLoginPayload.AddRange($PreLoginOptions)
+                            $null = $PreLoginPayload.AddRange($PreLoginData)
+                            
+                            $PayloadLength = $PreLoginPayload.Count
+                            $TotalLength = 8 + $PayloadLength
+                            
+                            $TdsHeader = @(0x12, 0x01, ([byte]($TotalLength -shr 8)), ([byte]($TotalLength -band 0xFF)), 0x00, 0x00, 0x00, 0x00)
+                            
+                            $TdsPacket = [System.Collections.ArrayList]@()
+                            $null = $TdsPacket.AddRange($TdsHeader)
+                            $null = $TdsPacket.AddRange($PreLoginPayload)
+                            
+                            $PacketBytes = [byte[]]$TdsPacket.ToArray()
+                            $Stream.Write($PacketBytes, 0, $PacketBytes.Length)
+                            $Stream.Flush()
+                            
+                            $ResponseHeader = New-Object byte[] 8
+                            $BytesRead = $Stream.Read($ResponseHeader, 0, 8)
+                            
+                            if($BytesRead -eq 8) {
+                                $ResponseLength = ([int]$ResponseHeader[2] -shl 8) + [int]$ResponseHeader[3]
+                                
+                                if($ResponseLength -gt 8) {
+                                    $ResponsePayload = New-Object byte[] ($ResponseLength - 8)
+                                    $BytesRead = $Stream.Read($ResponsePayload, 0, $ResponsePayload.Length)
+                                    
+                                    # Parse VERSION option (token 0x00)
+                                    $i = 0
+                                    while($i -lt $ResponsePayload.Length) {
+                                        $OptionType = $ResponsePayload[$i]
+                                        if($OptionType -eq 0xFF) { break }
+                                        if($OptionType -eq 0x00) {
+                                            $VersionOffset = ([int]$ResponsePayload[$i+1] -shl 8) + [int]$ResponsePayload[$i+2]
+                                            if($VersionOffset -lt $ResponsePayload.Length - 6) {
+                                                $Major = $ResponsePayload[$VersionOffset]
+                                                $Minor = $ResponsePayload[$VersionOffset + 1]
+                                                $Build = ([int]$ResponsePayload[$VersionOffset + 2] -shl 8) + [int]$ResponsePayload[$VersionOffset + 3]
+                                                
+                                                # Map version to SQL Server version name
+                                                $VersionName = switch($Major) {
+                                                    16 { "2022" }
+                                                    15 { "2019" }
+                                                    14 { "2017" }
+                                                    13 { "2016" }
+                                                    12 { "2014" }
+                                                    11 { "2012" }
+                                                    10 { "2008/2008R2" }
+                                                    9  { "2005" }
+                                                    default { "Unknown" }
+                                                }
+                                                
+                                                $VersionInfo = "$VersionName ($Major.$Minor.$Build)"
+                                                Write-Verbose -Message "  Version (TDS): $VersionInfo"
+                                            }
+                                            break
+                                        }
+                                        $i += 5
+                                    }
+                                }
+                            }
+                            
+                            $Stream.Close()
+                            $TcpClient.Close()
+                        }
+                    } catch {
+                        Write-Verbose -Message "  TDS version detection failed: $($_.Exception.Message)"
+                    } finally {
+                        if($TcpClient -ne $null) {
+                            if($TcpClient.Connected) {
+                                try { $TcpClient.Close() } catch { }
+                            }
+                            try { $TcpClient.Dispose() } catch { }
+                        }
+                    }
+                }
+                
                 # Test connection
                 $ConnTest = Get-SQLConnectionTest -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -SuppressVerbose
                 
@@ -16636,16 +16784,19 @@ Function  Get-SQLInstanceDomain
                     $LoginSuccess = "Yes"
                     Write-Verbose -Message "  Login successful"
                     
-                    # Get server information
+                    # Get server information (login and sysadmin status)
                     try {
                         $ServerInfo = Get-SQLServerInfo -Instance $SpnServerInstance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -SuppressVerbose
                         
                         if($ServerInfo)
                         {
-                            $VersionInfo = "$($ServerInfo.SQLServerMajorVersion) ($($ServerInfo.SQLServerVersionNumber))"
+                            # Only update version if we didn't get it from TDS
+                            if(-not $VersionInfo) {
+                                $VersionInfo = "$($ServerInfo.SQLServerMajorVersion) ($($ServerInfo.SQLServerVersionNumber))"
+                                Write-Verbose -Message "  Version (Authenticated): $VersionInfo"
+                            }
                             $CurrentLogin = $ServerInfo.Currentlogin
                             $IsSysadminStatus = $ServerInfo.IsSysadmin
-                            Write-Verbose -Message "  Version: $VersionInfo"
                             Write-Verbose -Message "  Current Login: $CurrentLogin"
                             Write-Verbose -Message "  SysAdmin: $IsSysadminStatus"
                         }
@@ -17019,16 +17170,19 @@ Function  Get-SQLInstanceDomain
                             $LoginSuccess = "Yes"
                             Write-Verbose -Message "        Login successful"
                             
-                            # Get server information
+                            # Get server information (login and sysadmin status)
                             try {
                                 $ServerInfo = Get-SQLServerInfo -Instance $NewInstance.Instance -Username $SQLUsername -Password $SQLPassword -Credential $SQLCredential -SuppressVerbose
                                 
                                 if($ServerInfo)
                                 {
-                                    $VersionInfo = "$($ServerInfo.SQLServerMajorVersion) ($($ServerInfo.SQLServerVersionNumber))"
+                                    # Only update version if we didn't get it already (from UDP or TDS)
+                                    if(-not $VersionInfo) {
+                                        $VersionInfo = "$($ServerInfo.SQLServerMajorVersion) ($($ServerInfo.SQLServerVersionNumber))"
+                                        Write-Verbose -Message "        Version (Authenticated): $VersionInfo"
+                                    }
                                     $CurrentLogin = $ServerInfo.Currentlogin
                                     $IsSysadminStatus = $ServerInfo.IsSysadmin
-                                    Write-Verbose -Message "        Version: $VersionInfo"
                                     Write-Verbose -Message "        Current Login: $CurrentLogin"
                                     Write-Verbose -Message "        SysAdmin: $IsSysadminStatus"
                                 }
