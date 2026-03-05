@@ -16417,9 +16417,22 @@ Function  Get-SQLInstanceDomain
                     try {
                         # Use TDS pre-login to test encryption enforcement
                         $TcpClient = New-Object System.Net.Sockets.TcpClient
-                        $TcpClient.ReceiveTimeout = 3000
-                        $TcpClient.SendTimeout = 3000
-                        $TcpClient.Connect($TestComputer, $TestPort)
+                        
+                        # Try to connect with timeout
+                        $ConnectResult = $TcpClient.BeginConnect($TestComputer, $TestPort, $null, $null)
+                        $WaitHandle = $ConnectResult.AsyncWaitHandle
+                        
+                        if($WaitHandle.WaitOne(3000, $false)) {
+                            try {
+                                $TcpClient.EndConnect($ConnectResult)
+                            } catch {
+                                # Connection failed
+                                $EncryptionStatus = "Unknown"
+                            }
+                        } else {
+                            # Timeout
+                            $EncryptionStatus = "Unknown"
+                        }
                         
                         if($TcpClient.Connected) {
                             $Stream = $TcpClient.GetStream()
@@ -16665,11 +16678,22 @@ Function Get-SQLEncryptionStatus
         try {
             # Create TCP connection
             $TcpClient = New-Object System.Net.Sockets.TcpClient
-            $TcpClient.ReceiveTimeout = $TimeOut * 1000
-            $TcpClient.SendTimeout = $TimeOut * 1000
             
             Write-Verbose "  Connecting to ${Computer}:${Port}..."
-            $TcpClient.Connect($Computer, $Port)
+            
+            # Try to connect with timeout
+            $ConnectResult = $TcpClient.BeginConnect($Computer, $Port, $null, $null)
+            $WaitHandle = $ConnectResult.AsyncWaitHandle
+            
+            if($WaitHandle.WaitOne($TimeOut * 1000, $false)) {
+                try {
+                    $TcpClient.EndConnect($ConnectResult)
+                } catch {
+                    throw "Connection failed: $($_.Exception.Message)"
+                }
+            } else {
+                throw "Connection timeout"
+            }
             
             if($TcpClient.Connected) {
                 Write-Verbose "  TCP connection established"
