@@ -16418,11 +16418,11 @@ Function  Get-SQLInstanceDomain
                         # Use TDS pre-login to test encryption enforcement
                         $TcpClient = New-Object System.Net.Sockets.TcpClient
                         
-                        # Try to connect with timeout
+                        # Try to connect with timeout (10 seconds)
                         $ConnectResult = $TcpClient.BeginConnect($TestComputer, $TestPort, $null, $null)
                         $WaitHandle = $ConnectResult.AsyncWaitHandle
                         
-                        if($WaitHandle.WaitOne(3000, $false)) {
+                        if($WaitHandle.WaitOne(10000, $false)) {
                             try {
                                 $TcpClient.EndConnect($ConnectResult)
                             } catch {
@@ -16436,8 +16436,8 @@ Function  Get-SQLInstanceDomain
                         
                         if($TcpClient.Connected) {
                             $Stream = $TcpClient.GetStream()
-                            $Stream.ReadTimeout = 3000
-                            $Stream.WriteTimeout = 3000
+                            $Stream.ReadTimeout = 10000
+                            $Stream.WriteTimeout = 5000
                             
                             # TDS pre-login packet
                             $PreLoginPayload = @(
@@ -16488,7 +16488,7 @@ Function  Get-SQLInstanceDomain
                                 }
                                 
                                 if($EncryptionOffset -ge 0 -and $EncryptionOffset -lt $ResponsePayload.Length) {
-                                    $EncryptionValue = $ResponsePayload[$EncryptionOffset - 8]
+                                    $EncryptionValue = $ResponsePayload[$EncryptionOffset]
                                     
                                     # Only 0x02 (TDS_ENCRYPT_NOT_SUP) means NOT enforced
                                     if($EncryptionValue -eq 0x02) {
@@ -16586,7 +16586,7 @@ Function Get-SQLEncryptionStatus
             SQL Server instance to test (e.g., "Server\Instance", "Server,1433", or "Server").
             
             .PARAMETER TimeOut
-            Connection timeout in seconds. Default is 3.
+            Connection timeout in seconds. Default is 10.
             
             .EXAMPLE
             PS C:\> Get-SQLEncryptionStatus -Instance "SQLServer1.domain.com" -Verbose
@@ -16617,7 +16617,7 @@ Function Get-SQLEncryptionStatus
         
         [Parameter(Mandatory = $false,
         HelpMessage = 'Connection timeout in seconds.')]
-        [int]$TimeOut = 3
+        [int]$TimeOut = 10
     )
     
     Begin
@@ -16722,8 +16722,9 @@ Function Get-SQLEncryptionStatus
             if($TcpClient.Connected) {
                 Write-Verbose "  TCP connection established"
                 $Stream = $TcpClient.GetStream()
+                # Set timeouts in milliseconds (convert from seconds)
                 $Stream.ReadTimeout = $TimeOut * 1000
-                $Stream.WriteTimeout = $TimeOut * 1000
+                $Stream.WriteTimeout = 1000  # Write timeout can be short
                 
                 # Build TDS pre-login packet (exactly as impacket does)
                 # TDS Header: Type=0x12 (Pre-Login), Status=0x01 (End of message), Length, SPID=0x0000, PacketID=0x00, Window=0x00
@@ -16810,19 +16811,8 @@ Function Get-SQLEncryptionStatus
                     throw
                 }
                 
-                # Give server time to respond
-                Start-Sleep -Milliseconds 1000
-                
-                # Check if connection is still alive
-                Write-Verbose "  Connection still alive: $($TcpClient.Connected)"
-                
-                # Read response
+                # Read response (Stream.Read is blocking and will wait for data up to ReadTimeout)
                 Write-Verbose "  Reading TDS pre-login response..."
-                if($Stream.DataAvailable) {
-                    Write-Verbose "  Data is available to read"
-                } else {
-                    Write-Verbose "  WARNING: No data available yet, attempting read anyway..."
-                }
                 $ResponseHeader = New-Object byte[] 8
                 $BytesRead = $Stream.Read($ResponseHeader, 0, 8)
                 Write-Verbose "  Read $BytesRead header bytes"
@@ -16880,13 +16870,12 @@ Function Get-SQLEncryptionStatus
                         }
                         
                         if($EncryptionOffset -ge 0) {
-                            # The offset is relative to the start of the packet (including header)
-                            # So we need to subtract 8 to get the index in the payload
-                            $PayloadIndex = $EncryptionOffset - 8
-                            Write-Verbose "  Encryption value at payload index: $PayloadIndex"
+                            # The offset is relative to the start of the PAYLOAD (not the packet)
+                            # So we use it directly as an index
+                            Write-Verbose "  Encryption value at payload offset: $EncryptionOffset"
                             
-                            if($PayloadIndex -ge 0 -and $PayloadIndex -lt $ResponsePayload.Length) {
-                                $EncryptionValue = $ResponsePayload[$PayloadIndex]
+                            if($EncryptionOffset -ge 0 -and $EncryptionOffset -lt $ResponsePayload.Length) {
+                                $EncryptionValue = $ResponsePayload[$EncryptionOffset]
                                 
                                 Write-Verbose "  Encryption flag value: 0x$($EncryptionValue.ToString('X2'))"
                         
@@ -16905,7 +16894,7 @@ Function Get-SQLEncryptionStatus
                         }
                     } else {
                         $EncryptionStatus = "Unknown"
-                        Write-Verbose "RESULT: Encryption offset out of range (offset: $EncryptionOffset, payload index: $PayloadIndex, payload length: $($ResponsePayload.Length))"
+                        Write-Verbose "RESULT: Encryption offset out of range (offset: $EncryptionOffset, payload length: $($ResponsePayload.Length))"
                     }
                 } else {
                     $EncryptionStatus = "Unknown"
