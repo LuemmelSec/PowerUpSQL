@@ -16502,11 +16502,16 @@ Function  Get-SQLInstanceDomain
                             
                             $ResponseHeader = New-Object byte[] 8
                             $BytesRead = $Stream.Read($ResponseHeader, 0, 8)
+                            Write-Verbose "  Read $BytesRead response header bytes"
                             
                             if($BytesRead -eq 8) {
                                 $ResponseLength = ([int]$ResponseHeader[2] -shl 8) + [int]$ResponseHeader[3]
-                                $ResponsePayload = New-Object byte[] ($ResponseLength - 8)
-                                $BytesRead = $Stream.Read($ResponsePayload, 0, $ResponsePayload.Length)
+                                Write-Verbose "  Response length: $ResponseLength"
+                                
+                                if($ResponseLength -gt 8) {
+                                    $ResponsePayload = New-Object byte[] ($ResponseLength - 8)
+                                    $BytesRead = $Stream.Read($ResponsePayload, 0, $ResponsePayload.Length)
+                                    Write-Verbose "  Read $BytesRead payload bytes"
                                 
                                 # Find ENCRYPTION option
                                 $i = 0
@@ -16522,25 +16527,38 @@ Function  Get-SQLInstanceDomain
                                     $i += 5
                                 }
                                 
-                                if($EncryptionOffset -ge 0 -and $EncryptionOffset -lt $ResponsePayload.Length) {
-                                    $EncryptionValue = $ResponsePayload[$EncryptionOffset]
-                                    
-                                    # Only 0x02 (TDS_ENCRYPT_NOT_SUP) means NOT enforced
-                                    if($EncryptionValue -eq 0x02) {
-                                        $EncryptionStatus = "No"
+                                if($EncryptionOffset -ge 0) {
+                                    if($EncryptionOffset -lt $ResponsePayload.Length) {
+                                        $EncryptionValue = $ResponsePayload[$EncryptionOffset]
+                                        
+                                        # Only 0x02 (TDS_ENCRYPT_NOT_SUP) means NOT enforced
+                                        if($EncryptionValue -eq 0x02) {
+                                            $EncryptionStatus = "No"
+                                        } else {
+                                            $EncryptionStatus = "Yes"
+                                        }
                                     } else {
-                                        $EncryptionStatus = "Yes"
+                                        Write-Verbose "  Encryption offset $EncryptionOffset out of range (payload length: $($ResponsePayload.Length))"
                                     }
+                                } else {
+                                    Write-Verbose "  Encryption option not found in response"
                                 }
+                                } else {
+                                    Write-Verbose "  Response length too short: $ResponseLength"
+                                }
+                            } else {
+                                Write-Verbose "  Failed to read response header (read $BytesRead bytes)"
                             }
                             
                             $Stream.Close()
                             $TcpClient.Close()
                         } else {
                             $EncryptionStatus = "Unknown"
+                            Write-Verbose "  TcpClient not connected"
                         }
                     } catch {
                         $EncryptionStatus = "Unknown"
+                        Write-Verbose "  Encryption test error: $($_.Exception.Message)"
                     } finally {
                         if($TcpClient -ne $null) {
                             if($TcpClient.Connected) {
