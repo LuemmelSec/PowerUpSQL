@@ -16677,22 +16677,38 @@ Function Get-SQLEncryptionStatus
         
         try {
             # Create TCP connection
+            Write-Verbose "  Creating TCP client..."
             $TcpClient = New-Object System.Net.Sockets.TcpClient
             
-            Write-Verbose "  Connecting to ${Computer}:${Port}..."
+            Write-Verbose "  Attempting connection to ${Computer}:${Port}..."
             
             # Try to connect with timeout
-            $ConnectResult = $TcpClient.BeginConnect($Computer, $Port, $null, $null)
-            $WaitHandle = $ConnectResult.AsyncWaitHandle
-            
-            if($WaitHandle.WaitOne($TimeOut * 1000, $false)) {
-                try {
-                    $TcpClient.EndConnect($ConnectResult)
-                } catch {
-                    throw "Connection failed: $($_.Exception.Message)"
+            try {
+                $ConnectResult = $TcpClient.BeginConnect($Computer, $Port, $null, $null)
+                Write-Verbose "  BeginConnect initiated..."
+                $WaitHandle = $ConnectResult.AsyncWaitHandle
+                
+                Write-Verbose "  Waiting for connection (timeout: $($TimeOut)s)..."
+                if($WaitHandle.WaitOne($TimeOut * 1000, $false)) {
+                    Write-Verbose "  Connection wait completed, calling EndConnect..."
+                    try {
+                        $TcpClient.EndConnect($ConnectResult)
+                        Write-Verbose "  EndConnect successful"
+                    } catch {
+                        Write-Verbose "  EndConnect failed: $($_.Exception.GetType().FullName) - $($_.Exception.Message)"
+                        throw "Connection failed: $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-Verbose "  Connection timed out after $($TimeOut) seconds"
+                    throw "Connection timeout"
                 }
-            } else {
-                throw "Connection timeout"
+            } catch {
+                Write-Verbose "  Connection error: $($_.Exception.GetType().FullName)"
+                Write-Verbose "  Error message: $($_.Exception.Message)"
+                if($_.Exception.InnerException) {
+                    Write-Verbose "  Inner exception: $($_.Exception.InnerException.GetType().FullName) - $($_.Exception.InnerException.Message)"
+                }
+                throw
             }
             
             if($TcpClient.Connected) {
@@ -16817,7 +16833,12 @@ Function Get-SQLEncryptionStatus
             }
         } catch {
             $EncryptionStatus = "Unknown"
-            Write-Verbose "RESULT: Error - $($_.Exception.Message)"
+            $ErrorDetails = "Type: $($_.Exception.GetType().FullName)`nMessage: $($_.Exception.Message)"
+            if($_.Exception.InnerException) {
+                $ErrorDetails += "`nInner: $($_.Exception.InnerException.GetType().FullName) - $($_.Exception.InnerException.Message)"
+            }
+            Write-Verbose "RESULT: Error - $ErrorDetails"
+            Write-Verbose "Full Error:`n$($_ | Out-String)"
         } finally {
             if($TcpClient -ne $null) {
                 if($TcpClient.Connected) {
